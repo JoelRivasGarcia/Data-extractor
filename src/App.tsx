@@ -59,33 +59,87 @@ export default function App() {
     setError(null);
     setUploadProgress({ current: 0, total: files.length });
 
-    for (let i = 0; i < files.length; i++) {
-      setUploadProgress(prev => ({ ...prev, current: i + 1 }));
-      const file = files[i];
-      try {
-        const base64 = await fileToBase64(file);
-        const result = await extractEquipmentData(base64, file.type);
-        
-        const newRecord: EquipmentRecord = {
-          id: crypto.randomUUID(),
-          imageUrl: base64,
-          code: result.code,
-          type: result.type as 'CTO' | 'MUFA' | 'RESERVA',
-          coordinates: result.coordinates,
-          timestamp: result.timestamp,
-          power: result.power,
-          extractedAt: new Date().toLocaleString()
-        };
+    // Process in small batches to avoid rate limits but still be fast
+    const batchSize = 3;
+    const results: EquipmentRecord[] = [];
+    
+    for (let i = 0; i < files.length; i += batchSize) {
+      const batch = files.slice(i, i + batchSize);
+      
+      const batchPromises = batch.map(async (file, index) => {
+        const currentIndex = i + index + 1;
+        try {
+          // Resize image before sending to save bandwidth and time
+          const resizedBase64 = await resizeImage(file);
+          const result = await extractEquipmentData(resizedBase64, 'image/jpeg');
+          
+          setUploadProgress(prev => ({ ...prev, current: Math.min(prev.current + 1, files.length) }));
+          
+          return {
+            id: crypto.randomUUID(),
+            imageUrl: resizedBase64,
+            code: result.code,
+            type: result.type as 'CTO' | 'MUFA' | 'RESERVA',
+            coordinates: result.coordinates,
+            timestamp: result.timestamp,
+            power: result.power,
+            extractedAt: new Date().toLocaleString()
+          };
+        } catch (err) {
+          console.error(`Error processing ${file.name}:`, err);
+          throw new Error(`Failed to process ${file.name}: ${err instanceof Error ? err.message : 'Unknown error'}`);
+        }
+      });
 
-        setRecords(prev => [newRecord, ...prev]);
+      try {
+        const batchResults = await Promise.all(batchPromises);
+        setRecords(prev => [...batchResults, ...prev]);
       } catch (err) {
-        console.error("Error processing file:", err);
-        setError(`Failed to process ${file.name}: ${err instanceof Error ? err.message : 'Unknown error'}`);
+        setError(err instanceof Error ? err.message : 'An error occurred during processing');
+        break; // Stop processing if a batch fails significantly
       }
     }
     
     setIsUploading(false);
     if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const resizeImage = (file: File): Promise<string> => {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = (event) => {
+        const img = new Image();
+        img.src = event.target?.result as string;
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          const MAX_WIDTH = 1600;
+          const MAX_HEIGHT = 1600;
+          let width = img.width;
+          let height = img.height;
+
+          if (width > height) {
+            if (width > MAX_WIDTH) {
+              height *= MAX_WIDTH / width;
+              width = MAX_WIDTH;
+            }
+          } else {
+            if (height > MAX_HEIGHT) {
+              width *= MAX_HEIGHT / height;
+              height = MAX_HEIGHT;
+            }
+          }
+
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          ctx?.drawImage(img, 0, 0, width, height);
+          
+          // Convert to JPEG with 0.8 quality for optimal balance
+          resolve(canvas.toDataURL('image/jpeg', 0.8));
+        };
+      };
+    });
   };
 
   const fileToBase64 = (file: File): Promise<string> => {
