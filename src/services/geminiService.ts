@@ -86,21 +86,42 @@ export async function extractEquipmentData(base64Image: string, mimeType: string
 
     } catch (error: any) {
       lastError = error;
-      // Only retry on 503 (Service Unavailable) or 429 (Too Many Requests)
-      const isTransient = error?.message?.includes('503') || 
-                          error?.message?.includes('429') || 
-                          error?.message?.includes('high demand');
+      const errorMessage = error?.message || String(error);
       
-      if (!isTransient || attempt === maxRetries) {
-        break;
+      // Check for transient errors: 503 (Demand), 429 (Rate Limit/Quota)
+      const isRateLimit = errorMessage.includes('429') || errorMessage.includes('quota');
+      const isOverloaded = errorMessage.includes('503') || errorMessage.includes('high demand');
+      
+      if ((isRateLimit || isOverloaded) && attempt < maxRetries) {
+        // Try to extract a suggested wait time from the error message (e.g., "retry in 26s")
+        let waitTime = Math.pow(2, attempt) * 2000; // Default backoff: 2s, 4s, 8s...
+        
+        const retryMatch = errorMessage.match(/retry in ([\d.]+)s/);
+        if (retryMatch) {
+          waitTime = (parseFloat(retryMatch[1]) + 1) * 1000; // Use Google's suggestion + 1s buffer
+        } else if (isRateLimit) {
+          waitTime = 15000; // If it's a rate limit but no time given, wait 15s
+        }
+
+        console.warn(`Attempt ${attempt + 1} failed (${isRateLimit ? 'Rate Limit' : 'Overloaded'}). Waiting ${waitTime/1000}s...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        continue;
       }
-      console.warn(`Attempt ${attempt + 1} failed due to high demand. Retrying...`);
+      
+      // If it's not a transient error or we're out of retries, stop
+      break;
     }
   }
 
-  console.error("Failed to parse AI response after retries:", lastError);
-  if (lastError?.message?.includes('high demand') || lastError?.message?.includes('503')) {
-    throw new Error("El servidor de Google está saturado temporalmente. Por favor, espera unos segundos e intenta subir la foto nuevamente.");
+  console.error("Failed to process image after retries:", lastError);
+  
+  const finalMessage = lastError?.message || "";
+  if (finalMessage.includes('429') || finalMessage.includes('quota')) {
+    throw new Error("Límite de cuota excedido (Google Free Tier). Has procesado muchas imágenes hoy o muy rápido. Espera un minuto o usa una API Key de pago.");
   }
-  throw new Error("No se pudo extraer la información de la imagen. Por favor, intenta con una foto más clara.");
+  if (finalMessage.includes('503') || finalMessage.includes('high demand')) {
+    throw new Error("El servidor de Google está saturado. Intenta de nuevo en unos segundos.");
+  }
+  
+  throw new Error("No se pudo extraer información. Asegúrate de que la foto sea clara y se vea bien el texto.");
 }

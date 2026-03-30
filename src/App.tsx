@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, ErrorInfo } from 'react';
 import { 
   Upload, 
   Table, 
@@ -17,22 +17,76 @@ import {
   Layers,
   RotateCcw,
   Zap,
-  Map
+  Map,
+  ArrowUpDown
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { EquipmentRecord } from './types';
 import { extractEquipmentData } from './services/geminiService';
+import { storage } from './lib/storage';
+
+// Error Boundary Component (Disabled due to linting issues)
+/*
+interface ErrorBoundaryProps {
+  children: React.ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  error: Error | null;
+}
+
+class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  public state: ErrorBoundaryState = {
+    hasError: false,
+    error: null
+  };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { hasError: true, error };
+  }
+
+  public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error("ErrorBoundary caught an error", error, errorInfo);
+  }
+
+  public render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-[#E4E3E0] p-8">
+          <div className="max-w-md w-full bg-white p-8 border-2 border-[#141414] shadow-[8px_8px_0px_0px_rgba(20,20,20,1)]">
+            <h1 className="font-serif italic text-2xl mb-4">Algo salió mal</h1>
+            <p className="text-sm mb-6 opacity-70">
+              La aplicación ha encontrado un error inesperado. Por favor, intenta recargar la página.
+            </p>
+            <div className="bg-red-50 p-4 border border-red-200 mb-6 overflow-auto max-h-40">
+              <code className="text-xs text-red-600">{this.state.error?.message}</code>
+            </div>
+            <button 
+              onClick={() => window.location.reload()}
+              className="w-full py-3 bg-[#141414] text-[#E4E3E0] font-bold uppercase tracking-widest hover:scale-[1.02] active:scale-[0.98] transition-all"
+            >
+              Recargar Aplicación
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+*/
 
 export default function App() {
-  const [records, setRecords] = useState<EquipmentRecord[]>(() => {
-    const saved = localStorage.getItem('equipment_records');
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [records, setRecords] = useState<EquipmentRecord[]>([]);
+  const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [isUploading, setIsUploading] = useState(false);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<'ALL' | 'CTO' | 'MUFA' | 'RESERVA'>('ALL');
+  const [sortOrder, setSortOrder] = useState<'NEWEST' | 'OLDEST' | 'SERIAL_ASC' | 'SERIAL_DESC' | 'POWER_ASC' | 'POWER_DESC'>('NEWEST');
   const [showDeleteAllConfirm, setShowDeleteAllConfirm] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ current: 0, total: 0 });
   const [uploadSummary, setUploadSummary] = useState<{
@@ -42,15 +96,84 @@ export default function App() {
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    localStorage.setItem('equipment_records', JSON.stringify(records));
-  }, [records]);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editValues, setEditValues] = useState<{ code: string; coordinates: string }>({ code: '', coordinates: '' });
 
-  const filteredRecords = records.filter(record => {
-    const matchesSearch = record.code.toLowerCase().includes(searchQuery.toLowerCase());
-    const matchesType = typeFilter === 'ALL' || record.type === typeFilter;
-    return matchesSearch && matchesType;
-  });
+  useEffect(() => {
+    const initStorage = async () => {
+      // 1. Try to migrate from localStorage if exists
+      const migrated = await storage.migrateFromLocalStorage();
+      if (migrated) {
+        setRecords(migrated);
+      } else {
+        // 2. Otherwise load from IndexedDB
+        const loaded = await storage.loadRecords();
+        setRecords(loaded);
+      }
+      setIsInitialLoad(false);
+    };
+    initStorage();
+  }, []);
+
+  useEffect(() => {
+    if (isInitialLoad) return;
+    
+    const saveToStorage = async () => {
+      try {
+        await storage.saveRecords(records);
+      } catch (err) {
+        console.error('Error saving to IndexedDB:', err);
+        setError('Error al guardar los datos. Es posible que el almacenamiento del navegador esté lleno.');
+      }
+    };
+    saveToStorage();
+  }, [records, isInitialLoad]);
+
+  const startEditing = (record: EquipmentRecord) => {
+    setEditingId(record.id);
+    setEditValues({ code: record.code, coordinates: record.coordinates });
+  };
+
+  const cancelEditing = () => {
+    setEditingId(null);
+  };
+
+  const saveEdit = (id: string) => {
+    setRecords(prev => prev.map(r => 
+      r.id === id ? { ...r, code: editValues.code, coordinates: editValues.coordinates } : r
+    ));
+    setEditingId(null);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent, id: string) => {
+    if (e.key === 'Enter') {
+      saveEdit(id);
+    } else if (e.key === 'Escape') {
+      cancelEditing();
+    }
+  };
+
+  const extractPowerValue = (powerStr: string) => {
+    const match = powerStr.match(/(-?\d+(?:\.\d+)?)/);
+    return match ? parseFloat(match[1]) : -Infinity;
+  };
+
+  const filteredRecords = records
+    .filter(record => {
+      const matchesSearch = (record.code || '').toLowerCase().includes(searchQuery.toLowerCase());
+      const matchesType = typeFilter === 'ALL' || record.type === typeFilter;
+      return matchesSearch && matchesType;
+    })
+    .sort((a, b) => {
+      if (sortOrder === 'SERIAL_ASC') return (a.code || '').localeCompare(b.code || '');
+      if (sortOrder === 'SERIAL_DESC') return (b.code || '').localeCompare(a.code || '');
+      if (sortOrder === 'POWER_ASC') return extractPowerValue(a.power || '') - extractPowerValue(b.power || '');
+      if (sortOrder === 'POWER_DESC') return extractPowerValue(b.power || '') - extractPowerValue(a.power || '');
+      return 0;
+    });
+
+  // Handle NEWEST/OLDEST by reversing if needed (since state is prepended)
+  const sortedRecords = sortOrder === 'OLDEST' ? [...filteredRecords].reverse() : filteredRecords;
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -80,13 +203,13 @@ export default function App() {
           const result = await extractEquipmentData(resizedBase64, 'image/jpeg');
           
           const newRecord: EquipmentRecord = {
-            id: crypto.randomUUID(),
+            id: typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
             imageUrl: resizedBase64,
-            code: result.code,
-            type: result.type as 'CTO' | 'MUFA' | 'RESERVA',
-            coordinates: result.coordinates,
-            timestamp: result.timestamp,
-            power: result.power,
+            code: result.code || 'S/N',
+            type: (result.type as 'CTO' | 'MUFA' | 'RESERVA') || 'CTO',
+            coordinates: result.coordinates || '0,0',
+            timestamp: result.timestamp || new Date().toLocaleString(),
+            power: result.power || 'N/A',
             extractedAt: new Date().toLocaleString()
           };
           
@@ -123,7 +246,7 @@ export default function App() {
   };
 
   const resizeImage = (file: File): Promise<string> => {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.readAsDataURL(file);
       reader.onload = (event) => {
@@ -131,8 +254,8 @@ export default function App() {
         img.src = event.target?.result as string;
         img.onload = () => {
           const canvas = document.createElement('canvas');
-          const MAX_WIDTH = 1600;
-          const MAX_HEIGHT = 1600;
+          const MAX_WIDTH = 1200; // Slightly smaller for better performance
+          const MAX_HEIGHT = 1200;
           let width = img.width;
           let height = img.height;
 
@@ -153,10 +276,11 @@ export default function App() {
           const ctx = canvas.getContext('2d');
           ctx?.drawImage(img, 0, 0, width, height);
           
-          // Convert to JPEG with 0.8 quality for optimal balance
-          resolve(canvas.toDataURL('image/jpeg', 0.8));
+          resolve(canvas.toDataURL('image/jpeg', 0.7));
         };
+        img.onerror = () => reject(new Error("Error al cargar la imagen"));
       };
+      reader.onerror = () => reject(new Error("Error al leer el archivo"));
     });
   };
 
@@ -383,7 +507,7 @@ export default function App() {
       <header className="border-b border-[#141414] p-6 flex justify-between items-center">
         <div>
           <h1 className="font-serif italic text-2xl tracking-tight">Optical Data Extractor</h1>
-          <p className="text-[11px] uppercase tracking-widest opacity-50 mt-1">Automated Inventory & GPS Logging</p>
+          <p className="text-[11px] uppercase tracking-widest opacity-50 mt-1">Inventario Automatizado y Registro GPS</p>
         </div>
         <div className="flex gap-4">
           <button 
@@ -392,7 +516,7 @@ export default function App() {
             className="flex items-center gap-2 border border-[#141414] px-4 py-2 text-xs uppercase tracking-widest hover:bg-[#141414] hover:text-[#E4E3E0] transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
           >
             <Map size={14} />
-            Export KML
+            Exportar KMZ
           </button>
           <button 
             onClick={exportToCSV}
@@ -400,14 +524,14 @@ export default function App() {
             className="flex items-center gap-2 border border-[#141414] px-4 py-2 text-xs uppercase tracking-widest hover:bg-[#141414] hover:text-[#E4E3E0] transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
           >
             <Download size={14} />
-            Export CSV
+            Exportar CSV
           </button>
           <button 
             onClick={() => fileInputRef.current?.click()}
             className="flex items-center gap-2 bg-[#141414] text-[#E4E3E0] px-4 py-2 text-xs uppercase tracking-widest hover:bg-opacity-90 transition-colors"
           >
             <Plus size={14} />
-            Upload Photo
+            Subir Foto
           </button>
         </div>
       </header>
@@ -452,14 +576,14 @@ export default function App() {
             <div className="flex flex-col items-center gap-4">
               <Loader2 className="animate-spin" size={48} />
               <p className="font-serif italic">
-                Analyzing equipment data ({uploadProgress.current} of {uploadProgress.total})...
+                Analizando datos del equipo ({uploadProgress.current} de {uploadProgress.total})...
               </p>
             </div>
           ) : (
             <>
               <Upload size={48} className="mb-4 opacity-20" />
-              <p className="font-serif italic text-xl mb-2">Drop equipment photos here</p>
-              <p className="text-[11px] uppercase tracking-widest opacity-50">or click to browse files</p>
+              <p className="font-serif italic text-xl mb-2">Suelta las fotos aquí</p>
+              <p className="text-[11px] uppercase tracking-widest opacity-50">o haz clic para buscar archivos</p>
             </>
           )}
         </div>
@@ -470,7 +594,7 @@ export default function App() {
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 opacity-30" size={16} />
             <input 
               type="text"
-              placeholder="Search by serial code..."
+              placeholder="Buscar por código serial..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-10 pr-4 py-2 bg-transparent border-b border-[#141414] border-opacity-10 focus:border-opacity-100 outline-none text-sm transition-all"
@@ -483,10 +607,10 @@ export default function App() {
               onChange={(e) => setTypeFilter(e.target.value as any)}
               className="bg-transparent border-b border-[#141414] border-opacity-10 focus:border-opacity-100 outline-none text-sm py-2 px-2 cursor-pointer transition-all"
             >
-              <option value="ALL">All Equipment</option>
-              <option value="CTO">CTO Only</option>
-              <option value="MUFA">MUFA Only</option>
-              <option value="RESERVA">RESERVA Only</option>
+              <option value="ALL">Todos los Equipos</option>
+              <option value="CTO">Solo CTO</option>
+              <option value="MUFA">Solo MUFA</option>
+              <option value="RESERVA">Solo RESERVA</option>
             </select>
           </div>
         </div>
@@ -494,14 +618,14 @@ export default function App() {
         {/* Data Grid */}
         <div className="space-y-4">
           <div className="flex items-center justify-between border-b border-[#141414] pb-2">
-            <h2 className="font-serif italic text-lg">Extracted Records</h2>
+            <h2 className="font-serif italic text-lg">Registros Extraídos</h2>
             <div className="flex items-center gap-4">
               { (searchQuery || typeFilter !== 'ALL') && (
                 <button 
-                  onClick={() => { setSearchQuery(''); setTypeFilter('ALL'); }}
+                  onClick={() => { setSearchQuery(''); setTypeFilter('ALL'); setSortOrder('NEWEST'); }}
                   className="text-[10px] uppercase tracking-widest text-red-500 hover:underline"
                 >
-                  Clear Filters
+                  Limpiar Filtros
                 </button>
               )}
               {records.length > 0 && (
@@ -510,21 +634,21 @@ export default function App() {
                   className="flex items-center gap-1 text-[10px] uppercase tracking-widest text-red-600 hover:bg-red-50 px-2 py-1 rounded transition-colors"
                 >
                   <Trash2 size={10} />
-                  {isFiltered ? 'Delete Filtered' : 'Delete All'}
+                  {isFiltered ? 'Eliminar Filtrados' : 'Eliminar Todo'}
                 </button>
               )}
               <span className="text-[11px] uppercase tracking-widest opacity-50">
-                {filteredRecords.length} of {records.length} Entries
+                {sortedRecords.length} de {records.length} Entradas
               </span>
             </div>
           </div>
 
-          {filteredRecords.length === 0 ? (
+          {sortedRecords.length === 0 ? (
             <div className="py-20 text-center opacity-30 bg-white rounded-lg border border-dashed border-[#141414] border-opacity-10">
               <p className="font-serif italic">
                 {records.length === 0 
-                  ? "No records found. Upload a photo to begin." 
-                  : "No matches found for your current filters."}
+                  ? "No se encontraron registros. Sube una foto para comenzar." 
+                  : "No hay coincidencias para los filtros actuales."}
               </p>
             </div>
           ) : (
@@ -532,17 +656,33 @@ export default function App() {
               <table className="w-full border-collapse">
                 <thead>
                   <tr className="text-left border-b border-[#141414] border-opacity-10">
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Preview</th>
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Type</th>
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Serial Code</th>
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Potencia</th>
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Coordinates</th>
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Timestamp</th>
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Actions</th>
+                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Vista Previa</th>
+                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Tipo</th>
+                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">
+                      <button 
+                        onClick={() => setSortOrder(sortOrder === 'SERIAL_ASC' ? 'SERIAL_DESC' : 'SERIAL_ASC')}
+                        className="flex items-center gap-1 hover:text-[#141414] transition-colors"
+                      >
+                        Código Serial
+                        <ArrowUpDown size={14} strokeWidth={3} className={sortOrder === 'SERIAL_ASC' || sortOrder === 'SERIAL_DESC' ? 'opacity-100 text-blue-600' : 'opacity-30'} />
+                      </button>
+                    </th>
+                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">
+                      <button 
+                        onClick={() => setSortOrder(sortOrder === 'POWER_ASC' ? 'POWER_DESC' : 'POWER_ASC')}
+                        className="flex items-center gap-1 hover:text-[#141414] transition-colors"
+                      >
+                        Potencia
+                        <ArrowUpDown size={14} strokeWidth={3} className={sortOrder === 'POWER_ASC' || sortOrder === 'POWER_DESC' ? 'opacity-100 text-blue-600' : 'opacity-30'} />
+                      </button>
+                    </th>
+                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Coordenadas</th>
+                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Fecha Foto</th>
+                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Acciones</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredRecords.map((record) => (
+                  {sortedRecords.map((record) => (
                     <motion.tr 
                       layout
                       initial={{ opacity: 0 }}
@@ -583,10 +723,26 @@ export default function App() {
                           </span>
                         </div>
                       </td>
-                      <td className="p-4 font-mono text-sm tracking-tight">
+                      <td 
+                        className="p-4 font-mono text-sm tracking-tight cursor-text"
+                        onDoubleClick={() => startEditing(record)}
+                        title="Doble clic para editar"
+                      >
                         <div className="flex items-center gap-2">
                           <Hash size={12} className="opacity-30 group-hover:opacity-100" />
-                          {record.code}
+                          {editingId === record.id ? (
+                            <input 
+                              type="text"
+                              value={editValues.code}
+                              onChange={(e) => setEditValues(prev => ({ ...prev, code: e.target.value }))}
+                              onKeyDown={(e) => handleKeyDown(e, record.id)}
+                              onBlur={() => saveEdit(record.id)}
+                              className="bg-white border border-[#141414] px-2 py-1 text-xs outline-none w-full text-[#141414]"
+                              autoFocus
+                            />
+                          ) : (
+                            record.code
+                          )}
                         </div>
                       </td>
                       <td className="p-4 font-mono text-sm tracking-tight">
@@ -595,10 +751,25 @@ export default function App() {
                           {record.power}
                         </div>
                       </td>
-                      <td className="p-4 font-mono text-sm tracking-tight">
+                      <td 
+                        className="p-4 font-mono text-sm tracking-tight cursor-text"
+                        onDoubleClick={() => startEditing(record)}
+                        title="Doble clic para editar"
+                      >
                         <div className="flex items-center gap-2">
                           <MapPin size={12} className="opacity-30 group-hover:opacity-100" />
-                          {record.coordinates}
+                          {editingId === record.id ? (
+                            <input 
+                              type="text"
+                              value={editValues.coordinates}
+                              onChange={(e) => setEditValues(prev => ({ ...prev, coordinates: e.target.value }))}
+                              onKeyDown={(e) => handleKeyDown(e, record.id)}
+                              onBlur={() => saveEdit(record.id)}
+                              className="bg-white border border-[#141414] px-2 py-1 text-xs outline-none w-full text-[#141414]"
+                            />
+                          ) : (
+                            record.coordinates
+                          )}
                         </div>
                       </td>
                       <td className="p-4 font-mono text-sm tracking-tight">
@@ -608,13 +779,15 @@ export default function App() {
                         </div>
                       </td>
                       <td className="p-4">
-                        <button 
-                          onClick={() => deleteRecord(record.id)}
-                          className="p-2 hover:bg-red-500 hover:text-white rounded transition-colors"
-                          title="Delete record"
-                        >
-                          <Trash2 size={16} />
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button 
+                            onClick={() => deleteRecord(record.id)}
+                            className="p-2 hover:bg-red-500 hover:text-white rounded transition-colors text-red-600"
+                            title="Eliminar"
+                          >
+                            <Trash2 size={16} />
+                          </button>
+                        </div>
                       </td>
                     </motion.tr>
                   ))}
@@ -668,24 +841,24 @@ export default function App() {
               className="bg-[#E4E3E0] p-8 max-w-md w-full rounded-lg border border-[#141414] shadow-2xl"
             >
               <h2 className="font-serif italic text-2xl mb-4 text-red-600">
-                Confirm {isFiltered ? 'Filtered' : 'Total'} Deletion
+                Confirmar Eliminación {isFiltered ? 'Filtrada' : 'Total'}
               </h2>
               <p className="text-sm mb-8 opacity-70 leading-relaxed">
-                Are you sure you want to delete <strong>{isFiltered ? `the ${filteredRecords.length} filtered` : `all ${records.length}`} records</strong>? 
-                {isFiltered ? ' Other records will be kept.' : ' This action cannot be undone and all extracted data will be lost.'}
+                ¿Estás seguro de que quieres eliminar <strong>{isFiltered ? `los ${filteredRecords.length} registros filtrados` : `todos los ${records.length} registros`}</strong>? 
+                {isFiltered ? ' Los demás registros se mantendrán.' : ' Esta acción no se puede deshacer y todos los datos extraídos se perderán.'}
               </p>
               <div className="flex gap-4">
                 <button 
                   onClick={() => setShowDeleteAllConfirm(false)}
                   className="flex-1 border border-[#141414] py-3 text-xs uppercase tracking-widest hover:bg-[#141414] hover:text-[#E4E3E0] transition-colors"
                 >
-                  Cancel
+                  Cancelar
                 </button>
                 <button 
                   onClick={deleteFilteredRecords}
                   className="flex-1 bg-red-600 text-white py-3 text-xs uppercase tracking-widest hover:bg-red-700 transition-colors"
                 >
-                  Yes, Delete {isFiltered ? 'Filtered' : 'All'}
+                  Sí, Eliminar {isFiltered ? 'Filtrados' : 'Todo'}
                 </button>
               </div>
             </motion.div>
