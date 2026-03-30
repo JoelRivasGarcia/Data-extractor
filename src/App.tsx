@@ -167,43 +167,58 @@ export default function App() {
     const dataToExport = filteredRecords;
     if (dataToExport.length === 0) return;
     
-    const headers = ['ID', 'Code', 'Type', 'Coordinates', 'Timestamp', 'Power', 'Extracted At'];
+    // Match the headers and order seen in the UI table
+    const headers = ['TIPO', 'CODIGO SERIAL', 'POTENCIA', 'COORDENADAS', 'FECHA/HORA FOTO', 'FECHA PROCESADO'];
     const rows = dataToExport.map(r => [
-      r.id,
-      `"${r.code}"`,
-      `"${r.type}"`,
-      `"${r.coordinates}"`,
-      `"${r.timestamp}"`,
-      `"${r.power}"`,
-      `"${r.extractedAt}"`
+      r.type,
+      r.code,
+      r.power,
+      r.coordinates,
+      r.timestamp,
+      r.extractedAt
     ]);
     
-    const csvContent = [headers, ...rows].map(e => e.join(",")).join("\n");
+    // Properly escape and quote CSV fields using semicolon (;) for Excel in Spanish locales
+    const formatCSVRow = (row: string[]) => {
+      return row.map(field => {
+        const stringField = String(field || '').replace(/"/g, '""');
+        return `"${stringField}"`;
+      }).join(";");
+    };
+
+    // Add BOM and "sep=;" for maximum Excel compatibility
+    const csvContent = "\uFEFF" + "sep=;\n" + [headers, ...rows].map(formatCSVRow).join("\n");
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.setAttribute("href", url);
-    link.setAttribute("download", `equipment_data_${new Date().toISOString().split('T')[0]}.csv`);
+    link.setAttribute("download", `datos_equipos_${new Date().toISOString().split('T')[0]}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
   };
 
   const parseCoordinates = (coordStr: string) => {
-    // Handles formats like:
+    if (!coordStr) return null;
+
+    // Handles various formats:
     // "12.11894S 77.02391W"
-    // "-12.11894 -77.02391"
-    // "12.11894, -77.02391"
-    const cleanStr = coordStr.replace(/,/g, ' ').trim();
-    const parts = cleanStr.split(/\s+/);
-    if (parts.length < 2) return null;
+    // "-12.11894, -77.02391"
+    // "12,11894S, 77,02391W"
+    
+    // 1. Clean the string but keep signs, dots, commas, and direction letters
+    const clean = coordStr.replace(/[^\d.,\sNSEW+-]/gi, ' ');
+    
+    // 2. Find all potential numeric parts with their optional direction
+    // This regex looks for a number (with . or ,) followed by an optional N,S,E,W
+    const partRegex = /([+-]?\d+(?:[.,]\d+)?)\s*([NSEW])?/gi;
+    const matches = Array.from(clean.matchAll(partRegex));
 
-    const parsePart = (part: string, isLat: boolean) => {
-      // Check for NSEW suffix
-      const match = part.match(/([+-]?[\d.]+)\s*([NSEW])?/i);
-      if (!match) return null;
+    if (matches.length < 2) return null;
 
-      let val = parseFloat(match[1]);
+    const processMatch = (match: RegExpMatchArray) => {
+      let numStr = match[1].replace(',', '.');
+      let val = parseFloat(numStr);
       const dir = match[2]?.toUpperCase();
 
       if (dir) {
@@ -213,10 +228,24 @@ export default function App() {
       return val;
     };
 
-    const lat = parsePart(parts[0], true);
-    const lon = parsePart(parts[1], false);
+    let lat = processMatch(matches[0]);
+    let lon = processMatch(matches[1]);
 
-    if (lat === null || lon === null || isNaN(lat) || isNaN(lon)) return null;
+    // Heuristics for Peru (User context: All images are from Peru)
+    // Peru Latitude: ~0 to -18 (South)
+    // Peru Longitude: ~-68 to -82 (West)
+    
+    // If no direction suffix was provided and values are positive, 
+    // but they fall within the expected absolute range for Peru, 
+    // we assume they should be negative.
+    if (!matches[0][2] && lat > 0 && lat < 25) {
+      lat = -lat;
+    }
+    if (!matches[1][2] && lon > 0 && lon > 60 && lon < 95) {
+      lon = -lon;
+    }
+
+    if (isNaN(lat) || isNaN(lon)) return null;
 
     return { lat, lon };
   };
@@ -225,30 +254,79 @@ export default function App() {
     const dataToExport = filteredRecords;
     if (dataToExport.length === 0) return;
 
+    // Group records by type
+    const groupedRecords = dataToExport.reduce((acc, record) => {
+      if (!acc[record.type]) {
+        acc[record.type] = [];
+      }
+      acc[record.type].push(record);
+      return acc;
+    }, {} as Record<string, EquipmentRecord[]>);
+
     let kmlContent = `<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
   <Document>
     <name>Optical Equipment Records - ${new Date().toLocaleDateString()}</name>
-    <description>Extracted data from optical equipment photos</description>`;
+    <description>Extracted data from optical equipment photos grouped by type</description>
+    
+    <Style id="style-CTO">
+      <IconStyle>
+        <Icon>
+          <href>http://maps.google.com/mapfiles/kml/paddle/blu-blank.png</href>
+        </Icon>
+        <scale>1.1</scale>
+      </IconStyle>
+    </Style>
+    
+    <Style id="style-MUFA">
+      <IconStyle>
+        <Icon>
+          <href>http://maps.google.com/mapfiles/kml/paddle/purple-blank.png</href>
+        </Icon>
+        <scale>1.1</scale>
+      </IconStyle>
+    </Style>
+    
+    <Style id="style-RESERVA">
+      <IconStyle>
+        <Icon>
+          <href>http://maps.google.com/mapfiles/kml/paddle/orange-blank.png</href>
+        </Icon>
+        <scale>1.1</scale>
+      </IconStyle>
+    </Style>
+`;
 
-    dataToExport.forEach(record => {
-      const coords = parseCoordinates(record.coordinates);
-      if (coords) {
-        kmlContent += `
-    <Placemark>
-      <name>${record.type}: ${record.code}</name>
-      <description><![CDATA[
-        <p><b>Type:</b> ${record.type}</p>
-        <p><b>Power:</b> ${record.power}</p>
-        <p><b>Timestamp:</b> ${record.timestamp}</p>
-        <p><b>Coordinates:</b> ${record.coordinates}</p>
-        <p><b>Extracted At:</b> ${record.extractedAt}</p>
-      ]]></description>
-      <Point>
-        <coordinates>${coords.lon},${coords.lat},0</coordinates>
-      </Point>
-    </Placemark>`;
-      }
+    // Iterate through each type group
+    (Object.entries(groupedRecords) as [string, EquipmentRecord[]][]).forEach(([type, records]) => {
+      kmlContent += `
+    <Folder>
+      <name>${type}</name>
+      <description>Records for equipment type: ${type}</description>`;
+
+      records.forEach(record => {
+        const coords = parseCoordinates(record.coordinates);
+        if (coords) {
+          kmlContent += `
+      <Placemark>
+        <name>${record.code}</name>
+        <styleUrl>#style-${record.type}</styleUrl>
+        <description><![CDATA[
+          <p><b>Type:</b> ${record.type}</p>
+          <p><b>Power:</b> ${record.power}</p>
+          <p><b>Timestamp:</b> ${record.timestamp}</p>
+          <p><b>Coordinates:</b> ${record.coordinates}</p>
+          <p><b>Extracted At:</b> ${record.extractedAt}</p>
+        ]]></description>
+        <Point>
+          <coordinates>${coords.lon},${coords.lat},0</coordinates>
+        </Point>
+      </Placemark>`;
+        }
+      });
+
+      kmlContent += `
+    </Folder>`;
     });
 
     kmlContent += `
