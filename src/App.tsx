@@ -35,6 +35,11 @@ export default function App() {
   const [typeFilter, setTypeFilter] = useState<'ALL' | 'CTO' | 'MUFA' | 'RESERVA'>('ALL');
   const [showDeleteAllConfirm, setShowDeleteAllConfirm] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ current: 0, total: 0 });
+  const [uploadSummary, setUploadSummary] = useState<{
+    total: number;
+    success: number;
+    failed: { name: string; error: string }[];
+  } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -57,25 +62,24 @@ export default function App() {
   const processFiles = async (files: File[]) => {
     setIsUploading(true);
     setError(null);
+    setUploadSummary(null);
     setUploadProgress({ current: 0, total: files.length });
 
-    // Process in small batches to avoid rate limits but still be fast
-    const batchSize = 3;
-    const results: EquipmentRecord[] = [];
+    const failed: { name: string; error: string }[] = [];
+    let successCount = 0;
+    
+    // Process in small batches
+    const batchSize = 2; // Reduced batch size to be safer with rate limits
     
     for (let i = 0; i < files.length; i += batchSize) {
       const batch = files.slice(i, i + batchSize);
       
-      const batchPromises = batch.map(async (file, index) => {
-        const currentIndex = i + index + 1;
+      const batchPromises = batch.map(async (file) => {
         try {
-          // Resize image before sending to save bandwidth and time
           const resizedBase64 = await resizeImage(file);
           const result = await extractEquipmentData(resizedBase64, 'image/jpeg');
           
-          setUploadProgress(prev => ({ ...prev, current: Math.min(prev.current + 1, files.length) }));
-          
-          return {
+          const newRecord: EquipmentRecord = {
             id: crypto.randomUUID(),
             imageUrl: resizedBase64,
             code: result.code,
@@ -85,20 +89,34 @@ export default function App() {
             power: result.power,
             extractedAt: new Date().toLocaleString()
           };
+          
+          successCount++;
+          return newRecord;
         } catch (err) {
           console.error(`Error processing ${file.name}:`, err);
-          throw new Error(`Failed to process ${file.name}: ${err instanceof Error ? err.message : 'Unknown error'}`);
+          failed.push({ 
+            name: file.name, 
+            error: err instanceof Error ? err.message : 'Error desconocido' 
+          });
+          return null;
+        } finally {
+          setUploadProgress(prev => ({ ...prev, current: Math.min(prev.current + 1, files.length) }));
         }
       });
 
-      try {
-        const batchResults = await Promise.all(batchPromises);
-        setRecords(prev => [...batchResults, ...prev]);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'An error occurred during processing');
-        break; // Stop processing if a batch fails significantly
+      const batchResults = await Promise.all(batchPromises);
+      const validResults = batchResults.filter((r): r is EquipmentRecord => r !== null);
+      
+      if (validResults.length > 0) {
+        setRecords(prev => [...validResults, ...prev]);
       }
     }
+    
+    setUploadSummary({
+      total: files.length,
+      success: successCount,
+      failed: failed
+    });
     
     setIsUploading(false);
     if (fileInputRef.current) fileInputRef.current.value = '';
@@ -670,6 +688,65 @@ export default function App() {
                   Yes, Delete {isFiltered ? 'Filtered' : 'All'}
                 </button>
               </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Upload Summary Modal */}
+      <AnimatePresence>
+        {uploadSummary && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[60] bg-[#141414] bg-opacity-90 flex items-center justify-center p-8"
+          >
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              className="bg-[#E4E3E0] p-8 max-w-2xl w-full rounded-lg border border-[#141414] shadow-2xl max-h-[80vh] flex flex-col"
+            >
+              <div className="flex justify-between items-center mb-6">
+                <h2 className="font-serif italic text-2xl">Resumen de Carga</h2>
+                <button onClick={() => setUploadSummary(null)} className="p-1 hover:bg-black hover:bg-opacity-5 rounded">
+                  <X size={24} />
+                </button>
+              </div>
+
+              <div className="grid grid-cols-3 gap-4 mb-8">
+                <div className="bg-white p-4 rounded border border-[#141414] border-opacity-10 text-center">
+                  <p className="text-[10px] uppercase tracking-widest opacity-50 mb-1">Total</p>
+                  <p className="text-2xl font-mono">{uploadSummary.total}</p>
+                </div>
+                <div className="bg-green-50 p-4 rounded border border-green-200 text-center">
+                  <p className="text-[10px] uppercase tracking-widest text-green-600 mb-1">Éxito</p>
+                  <p className="text-2xl font-mono text-green-700">{uploadSummary.success}</p>
+                </div>
+                <div className="bg-red-50 p-4 rounded border border-red-200 text-center">
+                  <p className="text-[10px] uppercase tracking-widest text-red-600 mb-1">Fallidos</p>
+                  <p className="text-2xl font-mono text-red-700">{uploadSummary.failed.length}</p>
+                </div>
+              </div>
+
+              {uploadSummary.failed.length > 0 && (
+                <div className="flex-1 overflow-y-auto space-y-3 pr-2">
+                  <p className="text-xs font-bold uppercase tracking-widest opacity-50 mb-2">Fotos que no se pudieron procesar:</p>
+                  {uploadSummary.failed.map((f, i) => (
+                    <div key={i} className="bg-white p-3 rounded border border-red-100 flex flex-col gap-1">
+                      <p className="text-sm font-mono truncate" title={f.name}>{f.name}</p>
+                      <p className="text-[10px] text-red-500 italic">{f.error}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <button 
+                onClick={() => setUploadSummary(null)}
+                className="mt-8 w-full bg-[#141414] text-[#E4E3E0] py-4 text-xs uppercase tracking-widest hover:bg-opacity-90 transition-colors"
+              >
+                Entendido
+              </button>
             </motion.div>
           </motion.div>
         )}
