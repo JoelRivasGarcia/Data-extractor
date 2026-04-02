@@ -2,6 +2,13 @@ import { get, set, del, clear, keys } from 'idb-keyval';
 import { EquipmentRecord } from '../types';
 
 const STORAGE_KEY = 'equipment_records_v2';
+const PENDING_KEY = 'pending_uploads_v2';
+
+export interface PendingUpload {
+  id: string;
+  blob: Blob;
+  name: string;
+}
 
 export const storage = {
   async saveRecords(records: EquipmentRecord[]): Promise<void> {
@@ -15,6 +22,30 @@ export const storage = {
 
   async clearAll(): Promise<void> {
     await clear();
+  },
+
+  // Pending Uploads Management
+  async savePendingUploads(uploads: PendingUpload[]): Promise<void> {
+    await set(PENDING_KEY, uploads);
+  },
+
+  async getPendingUploads(): Promise<PendingUpload[]> {
+    const uploads = await get<PendingUpload[]>(PENDING_KEY);
+    return uploads || [];
+  },
+
+  async removePendingUpload(id: string): Promise<void> {
+    const uploads = await this.getPendingUploads();
+    const updated = uploads.filter(u => u.id !== id);
+    if (updated.length === 0) {
+      await del(PENDING_KEY);
+    } else {
+      await set(PENDING_KEY, updated);
+    }
+  },
+
+  async clearPendingUploads(): Promise<void> {
+    await del(PENDING_KEY);
   },
 
   // Migration from localStorage

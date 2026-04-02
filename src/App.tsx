@@ -21,9 +21,11 @@ import {
   ArrowUpDown
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import EXIF from 'exif-js';
+import Tesseract from 'tesseract.js';
 import { EquipmentRecord } from './types';
 import { extractEquipmentData } from './services/geminiService';
-import { storage } from './lib/storage';
+import { storage, PendingUpload } from './lib/storage';
 
 // Error Boundary Component (Disabled due to linting issues)
 /*
@@ -82,11 +84,14 @@ export default function App() {
   const [records, setRecords] = useState<EquipmentRecord[]>([]);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [isUploading, setIsUploading] = useState(false);
+  const [isResuming, setIsResuming] = useState(false);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<'ALL' | 'CTO' | 'MUFA' | 'RESERVA'>('ALL');
+  const [uploadType, setUploadType] = useState<'CTO' | 'MUFA' | 'RESERVA'>('CTO');
   const [sortOrder, setSortOrder] = useState<'NEWEST' | 'OLDEST' | 'SERIAL_ASC' | 'SERIAL_DESC' | 'POWER_ASC' | 'POWER_DESC'>('NEWEST');
+  const [selectedModel, setSelectedModel] = useState<string>("gemini-3-flash-preview");
   const [showDeleteAllConfirm, setShowDeleteAllConfirm] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ current: 0, total: 0 });
   const [uploadSummary, setUploadSummary] = useState<{
@@ -110,6 +115,14 @@ export default function App() {
         const loaded = await storage.loadRecords();
         setRecords(loaded);
       }
+
+      // 3. Check for pending uploads to resume
+      const pending = await storage.getPendingUploads();
+      if (pending.length > 0) {
+        console.log(`Resuming ${pending.length} pending uploads...`);
+        processFiles(pending, true);
+      }
+
       setIsInitialLoad(false);
     };
     initStorage();
@@ -128,6 +141,10 @@ export default function App() {
     };
     saveToStorage();
   }, [records, isInitialLoad]);
+
+  const clearNewHighlights = () => {
+    setRecords(prev => prev.map(r => ({ ...r, isNew: false })));
+  };
 
   const startEditing = (record: EquipmentRecord) => {
     setEditingId(record.id);
@@ -179,41 +196,268 @@ export default function App() {
     const files = e.target.files;
     if (!files || files.length === 0) return;
     
-    await processFiles(Array.from(files));
+    const fileList = Array.from(files) as File[];
+    // Save to pending queue before starting
+    const pending: PendingUpload[] = fileList.map(file => ({
+      id: Math.random().toString(36).substring(2, 15),
+      blob: file as Blob,
+      name: file.name
+    }));
+    
+    await storage.savePendingUploads(pending);
+    await processFiles(pending);
   };
 
-  const processFiles = async (files: File[]) => {
+  const getExifData = (file: File): Promise<{ coordinates: string | null; timestamp: string | null }> => {
+    return new Promise((resolve) => {
+      EXIF.getData(file as any, function(this: any) {
+        const lat = EXIF.getTag(this, "GPSLatitude");
+        const latRef = EXIF.getTag(this, "GPSLatitudeRef");
+        const lon = EXIF.getTag(this, "GPSLongitude");
+        const lonRef = EXIF.getTag(this, "GPSLongitudeRef");
+        const date = EXIF.getTag(this, "DateTimeOriginal") || EXIF.getTag(this, "DateTime");
+
+        let coords = null;
+        if (lat && lon) {
+          const latDec = (lat[0] + lat[1] / 60 + lat[2] / 3600) * (latRef === "S" ? -1 : 1);
+          const lonDec = (lon[0] + lon[1] / 60 + lon[2] / 3600) * (lonRef === "W" ? -1 : 1);
+          coords = `${latDec.toFixed(6)}, ${lonDec.toFixed(6)}`;
+        }
+
+        let timestamp = null;
+        if (date) {
+          // EXIF date format is YYYY:MM:DD HH:MM:SS
+          const parts = date.split(' ');
+          if (parts.length === 2) {
+            timestamp = `${parts[0].replace(/:/g, '/')} ${parts[1]}`;
+          }
+        }
+
+        resolve({ coordinates: coords, timestamp });
+      });
+    });
+  };
+
+  const runLocalOCR = async (file: File): Promise<string> => {
+    try {
+      const result = await Tesseract.recognize(file, 'eng', {
+        logger: m => console.log(m)
+      });
+      return result.data.text;
+    } catch (err) {
+      console.error("OCR Error:", err);
+      return "";
+    }
+  };
+
+  const validateData = (data: { code?: string; coordinates?: string; timestamp?: string; type?: string }) => {
+    const coordRegex = /^-?\d{1,2}\.\d+,\s*-?\d{1,3}\.\d+$/;
+    // Stricter serial code pattern: must have at least one number and be alphanumeric
+    const codeRegex = /^(?=.*[0-9])[A-Z0-9-]{6,20}$/i;
+    
+    // Blacklist of words that are definitely not serial numbers (districts, common labels)
+    const blacklist = ['SURQUILLO', 'MIRAFLORES', 'LIMA', 'PERU', 'CTO', 'MUFA', 'RESERVA', 'TELEFONICA', 'CLARO', 'ENTEL'];
+    const isBlacklisted = data.code ? blacklist.includes(data.code.toUpperCase()) : false;
+    
+    const isCoordsValid = data.coordinates ? coordRegex.test(data.coordinates) : false;
+    
+    // CTO specific validation: MUST start with WN-
+    let isCodeValid = data.code ? (codeRegex.test(data.code) && !isBlacklisted) : false;
+    if (data.type === 'CTO' && data.code && !data.code.toUpperCase().startsWith('WN-')) {
+      isCodeValid = false;
+    }
+
+    const isTimestampValid = !!data.timestamp;
+
+    return {
+      isCoordsValid,
+      isCodeValid,
+      isTimestampValid,
+      isValid: isCoordsValid && isCodeValid && isTimestampValid
+    };
+  };
+
+  const extractSerialFromText = (text: string): string | null => {
+    // Clean text: remove spaces that might break the WN- prefix
+    const cleanText = text.replace(/\s+/g, '');
+    
+    const patterns = [
+      /(WN-[A-Z0-9-]{6,15})/i, // Specific CTO pattern
+      /(?:SN|S\/N|COD|CODE|SERIAL|ID)[:\s]*([A-Z0-9-]{6,15})/i,
+      /\b(WN[0-9]{4,12})\b/i, // Handle cases where the dash is missing
+      /\b([A-Z0-9]{2,4}[0-9]{4,10})\b/i
+    ];
+
+    for (const pattern of patterns) {
+      const match = cleanText.match(pattern) || text.match(pattern);
+      if (match) return match[1] || match[0];
+    }
+    return null;
+  };
+
+  const extractCoordsFromText = (text: string): string | null => {
+    // Handle formats like: 12.117775S 77.015488W or -12.117775, -77.015488
+    // Pattern 1: Decimal with S/W suffixes (Common in field cameras)
+    const swPattern = /(-?\d+\.\d+)\s*[Ss]\s*(-?\d+\.\d+)\s*[Ww]/;
+    // Pattern 2: Standard lat, lon
+    const stdPattern = /(-?\d+\.\d+)[,\s]+(-?\d+\.\d+)/;
+
+    const swMatch = text.match(swPattern);
+    if (swMatch) {
+      // If it has S/W, we ensure they are negative for Peru
+      const lat = -Math.abs(parseFloat(swMatch[1]));
+      const lon = -Math.abs(parseFloat(swMatch[2]));
+      return `${lat.toFixed(6)}, ${lon.toFixed(6)}`;
+    }
+
+    const stdMatch = text.match(stdPattern);
+    if (stdMatch) {
+      return `${parseFloat(stdMatch[1]).toFixed(6)}, ${parseFloat(stdMatch[2]).toFixed(6)}`;
+    }
+
+    return null;
+  };
+
+  const extractPowerFromText = (text: string): string | null => {
+    // Look for patterns like -18.50 dBm or -20.1
+    const pattern = /(-?\d{1,2}\.\d{1,2})\s*(?:dBm|uW)?/i;
+    const match = text.match(pattern);
+    if (match) {
+      return `${match[1]} dBm`;
+    }
+    return null;
+  };
+
+  const processFiles = async (items: (File | PendingUpload)[], isResumingBatch = false) => {
     setIsUploading(true);
+    setIsResuming(isResumingBatch);
     setError(null);
-    setUploadSummary(null);
-    setUploadProgress({ current: 0, total: files.length });
+    if (!isResumingBatch) setUploadSummary(null);
+    setUploadProgress({ current: 0, total: items.length });
+
+    // Clear "isNew" status from existing records when a new upload starts
+    setRecords(prev => prev.map(r => ({ ...r, isNew: false })));
 
     const failed: { name: string; error: string }[] = [];
     let successCount = 0;
     
     // Process in small batches
-    const batchSize = 2; // Reduced batch size to be safer with rate limits
+    const batchSize = 2;
     
-    for (let i = 0; i < files.length; i += batchSize) {
-      const batch = files.slice(i, i + batchSize);
+    for (let i = 0; i < items.length; i += batchSize) {
+      const batch = items.slice(i, i + batchSize);
       
-      const batchPromises = batch.map(async (file) => {
+      const batchPromises = batch.map(async (item) => {
+        const file = 'blob' in item ? new File([item.blob], item.name, { type: item.blob.type }) : item;
+        const itemId = 'id' in item ? item.id : null;
+
         try {
+          // 1. Try Local Extraction (EXIF + OCR)
+          const exif = await getExifData(file);
+          const ocrText = await runLocalOCR(file);
+          
+          let localData = {
+            code: extractSerialFromText(ocrText) || '',
+            coordinates: exif.coordinates || extractCoordsFromText(ocrText) || '',
+            timestamp: exif.timestamp || '',
+            power: extractPowerFromText(ocrText) || '',
+            type: uploadType,
+            method: 'LOCAL' as const
+          };
+
+          const validation = validateData({ ...localData, type: uploadType });
+          let finalData: { code: string; coordinates: string; timestamp: string; power: string; type: 'CTO' | 'MUFA' | 'RESERVA'; method: 'LOCAL' | 'GEMINI' | 'HYBRID' } = { ...localData, power: localData.power || 'N/A' };
+          let extractionMethod: 'LOCAL' | 'GEMINI' | 'HYBRID' = 'LOCAL';
+
+          // 2. Fallback to Gemini if local is incomplete or invalid
+          if (!validation.isValid) {
+            // Wait for rate limiter (max 1 request every 8 seconds to stay under 7-8 RPM free tier)
+            const now = Date.now();
+            const timeSinceLastCall = now - (window as any).lastGeminiCall || 0;
+            const minDelay = 8000; 
+            if (timeSinceLastCall < minDelay) {
+              await new Promise(resolve => setTimeout(resolve, minDelay - timeSinceLastCall));
+            }
+            (window as any).lastGeminiCall = Date.now();
+
+            const resizedBase64 = await resizeImage(file);
+            
+            let geminiResult = null;
+            let usedModel = selectedModel === "gemini-3-flash-preview" 
+              ? "Gemini 3" 
+              : "Gemini Lite";
+
+            const tryModel = async (model: string, label: string) => {
+              try {
+                const { result } = await extractEquipmentData(resizedBase64, 'image/jpeg', model);
+                return { result, label };
+              } catch (err: any) {
+                const msg = err.message?.toLowerCase() || "";
+                const isRetryable = msg.includes('429') || msg.includes('quota') || msg.includes('503') || msg.includes('limit') || msg.includes('overloaded') || msg.includes('not found');
+                return { error: err, retryable: isRetryable };
+              }
+            };
+
+            const models = [
+              { id: "gemini-3-flash-preview", label: "Gemini 3" },
+              { id: "gemini-3.1-flash-lite-preview", label: "Gemini Lite" }
+            ];
+
+            const otherModels = models.filter(m => m.id !== selectedModel);
+            
+            let extraction = await tryModel(selectedModel, usedModel);
+            
+            if (extraction.error && extraction.retryable) {
+              for (const model of otherModels) {
+                console.warn(`${usedModel} falló. Probando ${model.label}...`);
+                extraction = await tryModel(model.id, model.label);
+                if (extraction.result) break;
+              }
+            }
+
+            if (extraction.result) {
+              geminiResult = extraction.result;
+              usedModel = extraction.label || "Gemini";
+            } else {
+              throw extraction.error || new Error("No se pudo procesar con ninguna versión de IA");
+            }
+
+            if (geminiResult) {
+              // Merge results: prefer local if valid, otherwise use Gemini
+              finalData = {
+                code: validation.isCodeValid ? localData.code : (geminiResult.code || 'S/N'),
+                coordinates: validation.isCoordsValid ? localData.coordinates : (geminiResult.coordinates || '0,0'),
+                timestamp: validation.isTimestampValid ? localData.timestamp : (geminiResult.timestamp || new Date().toLocaleString()),
+                power: geminiResult.power || localData.power || 'N/A',
+                type: uploadType, // User selected type takes precedence
+                method: validation.isValid ? 'LOCAL' : (Object.values(validation).some(v => v) ? 'HYBRID' : 'GEMINI')
+              };
+              extractionMethod = finalData.method;
+              (finalData as any).aiModel = usedModel;
+            }
+          }
+
           const resizedBase64 = await resizeImage(file);
-          const result = await extractEquipmentData(resizedBase64, 'image/jpeg');
           
           const newRecord: EquipmentRecord = {
             id: typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
             imageUrl: resizedBase64,
-            code: result.code || 'S/N',
-            type: (result.type as 'CTO' | 'MUFA' | 'RESERVA') || 'CTO',
-            coordinates: result.coordinates || '0,0',
-            timestamp: result.timestamp || new Date().toLocaleString(),
-            power: result.power || 'N/A',
-            extractedAt: new Date().toLocaleString()
+            code: finalData.code || 'S/N',
+            type: uploadType,
+            coordinates: finalData.coordinates || '0,0',
+            timestamp: finalData.timestamp || new Date().toLocaleString(),
+            power: finalData.power || 'N/A',
+            extractedAt: new Date().toLocaleString(),
+            method: extractionMethod,
+            aiModel: (finalData as any).aiModel || (extractionMethod === 'LOCAL' ? 'N/A' : 'Gemini 3'),
+            isNew: true
           };
           
           successCount++;
+          // Remove from pending queue after success
+          if (itemId) {
+            await storage.removePendingUpload(itemId);
+          }
           return newRecord;
         } catch (err) {
           console.error(`Error processing ${file.name}:`, err);
@@ -223,7 +467,7 @@ export default function App() {
           });
           return null;
         } finally {
-          setUploadProgress(prev => ({ ...prev, current: Math.min(prev.current + 1, files.length) }));
+          setUploadProgress(prev => ({ ...prev, current: Math.min(prev.current + 1, items.length) }));
         }
       });
 
@@ -233,15 +477,28 @@ export default function App() {
       if (validResults.length > 0) {
         setRecords(prev => [...validResults, ...prev]);
       }
+
+      // Add a small delay between batches to stay under the 10 RPM limit (Free Tier)
+      if (i + batchSize < items.length) {
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
     }
     
+    if (isResuming) {
+      // If we were resuming and finished, clear any leftovers just in case
+      if (failed.length === 0) {
+        await storage.clearPendingUploads();
+      }
+    }
+
     setUploadSummary({
-      total: files.length,
+      total: items.length,
       success: successCount,
       failed: failed
     });
     
     setIsUploading(false);
+    setIsResuming(false);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -297,9 +554,15 @@ export default function App() {
     setRecords(prev => prev.filter(r => r.id !== id));
   };
 
-  const deleteFilteredRecords = () => {
+  const deleteFilteredRecords = async () => {
     const filteredIds = new Set(filteredRecords.map(r => r.id));
     setRecords(prev => prev.filter(r => !filteredIds.has(r.id)));
+    
+    // If not filtered, we are deleting everything, so clear pending too
+    if (!isFiltered) {
+      await storage.clearPendingUploads();
+    }
+    
     setShowDeleteAllConfirm(false);
   };
 
@@ -509,7 +772,7 @@ export default function App() {
           <h1 className="font-serif italic text-2xl tracking-tight">Optical Data Extractor</h1>
           <p className="text-[11px] uppercase tracking-widest opacity-50 mt-1">Inventario Automatizado y Registro GPS</p>
         </div>
-        <div className="flex gap-4">
+        <div className="flex gap-4 items-start">
           <button 
             onClick={exportToKML}
             disabled={records.length === 0}
@@ -526,13 +789,26 @@ export default function App() {
             <Download size={14} />
             Exportar CSV
           </button>
-          <button 
-            onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-2 bg-[#141414] text-[#E4E3E0] px-4 py-2 text-xs uppercase tracking-widest hover:bg-opacity-90 transition-colors"
-          >
-            <Plus size={14} />
-            Subir Foto
-          </button>
+          <div className="flex flex-col items-end gap-1">
+            <button 
+              onClick={() => fileInputRef.current?.click()}
+              className="flex items-center gap-2 bg-[#141414] text-[#E4E3E0] px-4 py-2 text-xs uppercase tracking-widest hover:bg-opacity-90 transition-colors"
+            >
+              <Plus size={14} />
+              Subir Foto
+            </button>
+            <div className="flex items-center gap-1 opacity-30 hover:opacity-100 transition-opacity">
+              <span className="text-[9px] uppercase tracking-tighter font-bold">IA:</span>
+              <select 
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                className="bg-transparent border-none text-[9px] font-bold outline-none cursor-pointer p-0 appearance-none text-right"
+              >
+                <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
+                <option value="gemini-3.1-flash-lite-preview">Gemini 3.1 Lite</option>
+              </select>
+            </div>
+          </div>
         </div>
       </header>
 
@@ -544,26 +820,73 @@ export default function App() {
               initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -10 }}
-              className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative flex justify-between items-center"
+              className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative flex flex-col md:flex-row justify-between items-center gap-4"
             >
-              <span className="text-sm">{error}</span>
-              <button onClick={() => setError(null)}><X size={16} /></button>
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-medium">{error}</span>
+              </div>
+              <div className="flex items-center gap-3">
+                {error.includes('cuota') && (
+                  <button 
+                    onClick={async () => {
+                      setError(null);
+                      const pending = await storage.getPendingUploads();
+                      if (pending.length > 0) {
+                        processFiles(pending, true);
+                      }
+                    }}
+                    className="bg-red-600 text-white px-3 py-1 rounded text-xs font-bold uppercase tracking-wider hover:bg-red-700 transition-colors"
+                  >
+                    Reintentar ahora
+                  </button>
+                )}
+                <button onClick={() => setError(null)} className="p-1 hover:bg-red-200 rounded transition-colors">
+                  <X size={16} />
+                </button>
+              </div>
             </motion.div>
           )}
         </AnimatePresence>
 
         {/* Upload Area */}
-        <div 
-          onDragOver={onDragOver}
-          onDrop={onDrop}
-          onClick={() => fileInputRef.current?.click()}
-          className={`
-            border-2 border-dashed border-[#141414] border-opacity-20 rounded-lg p-12
-            flex flex-col items-center justify-center cursor-pointer
-            hover:border-opacity-100 hover:bg-[#141414] hover:bg-opacity-5 transition-all
-            ${isUploading ? 'pointer-events-none opacity-50' : ''}
-          `}
-        >
+        <div className="space-y-4">
+          <div className="flex items-center justify-between bg-white p-4 rounded-lg border border-[#141414] border-opacity-10 shadow-sm">
+            <div className="flex items-center gap-3">
+              <Layers size={18} className="opacity-50" />
+              <span className="text-xs uppercase tracking-widest font-bold">Tipo:</span>
+              <div className="flex gap-2">
+                {(['CTO', 'MUFA', 'RESERVA'] as const).map((type) => (
+                  <button
+                    key={type}
+                    onClick={() => setUploadType(type)}
+                    className={`px-3 py-1 text-[10px] font-bold uppercase tracking-widest border transition-all ${
+                      uploadType === type 
+                        ? 'bg-[#141414] text-[#E4E3E0] border-[#141414]' 
+                        : 'border-[#141414] border-opacity-20 opacity-50 hover:opacity-100'
+                    }`}
+                  >
+                    {type}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="text-[10px] uppercase tracking-widest opacity-50 flex items-center gap-2">
+              <Zap size={12} className="text-yellow-500" />
+              Modo Híbrido Activo (OCR Local + Gemini)
+            </div>
+          </div>
+
+          <div 
+            onDragOver={onDragOver}
+            onDrop={onDrop}
+            onClick={() => fileInputRef.current?.click()}
+            className={`
+              border-2 border-dashed border-[#141414] border-opacity-20 rounded-lg p-12
+              flex flex-col items-center justify-center cursor-pointer
+              hover:border-opacity-100 hover:bg-[#141414] hover:bg-opacity-5 transition-all
+              ${isUploading ? 'pointer-events-none opacity-50' : ''}
+            `}
+          >
           <input 
             type="file" 
             ref={fileInputRef} 
@@ -576,7 +899,7 @@ export default function App() {
             <div className="flex flex-col items-center gap-4">
               <Loader2 className="animate-spin" size={48} />
               <p className="font-serif italic">
-                Analizando datos del equipo ({uploadProgress.current} de {uploadProgress.total})...
+                {isResuming ? 'Reanudando carga pendiente' : 'Analizando datos del equipo'} ({uploadProgress.current} de {uploadProgress.total})...
               </p>
             </div>
           ) : (
@@ -587,8 +910,9 @@ export default function App() {
             </>
           )}
         </div>
+      </div>
 
-        {/* Search and Filters */}
+      {/* Search and Filters */}
         <div className="flex flex-col md:flex-row gap-4 items-center bg-white p-4 rounded-lg border border-[#141414] border-opacity-10 shadow-sm">
           <div className="relative flex-1 w-full">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 opacity-30" size={16} />
@@ -620,6 +944,14 @@ export default function App() {
           <div className="flex items-center justify-between border-b border-[#141414] pb-2">
             <h2 className="font-serif italic text-lg">Registros Extraídos</h2>
             <div className="flex items-center gap-4">
+              {records.some(r => r.isNew) && (
+                <button 
+                  onClick={clearNewHighlights}
+                  className="text-[10px] uppercase tracking-widest text-blue-600 hover:underline bg-blue-50 px-2 py-1 rounded border border-blue-200"
+                >
+                  Marcar Revisados
+                </button>
+              )}
               { (searchQuery || typeFilter !== 'ALL') && (
                 <button 
                   onClick={() => { setSearchQuery(''); setTypeFilter('ALL'); setSortOrder('NEWEST'); }}
@@ -678,6 +1010,7 @@ export default function App() {
                     </th>
                     <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Coordenadas</th>
                     <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Fecha Foto</th>
+                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Método</th>
                     <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Acciones</th>
                   </tr>
                 </thead>
@@ -688,7 +1021,11 @@ export default function App() {
                       initial={{ opacity: 0 }}
                       animate={{ opacity: 1 }}
                       key={record.id}
-                      className="group border-b border-[#141414] border-opacity-5 hover:bg-[#141414] hover:text-[#E4E3E0] transition-all cursor-default"
+                      className={`group border-b border-[#141414] border-opacity-5 transition-all cursor-default ${
+                        record.isNew 
+                          ? 'bg-amber-50 hover:bg-[#141414] hover:text-[#E4E3E0]' 
+                          : 'hover:bg-[#141414] hover:text-[#E4E3E0]'
+                      }`}
                     >
                       <td className="p-4">
                         <div 
@@ -776,6 +1113,24 @@ export default function App() {
                         <div className="flex items-center gap-2">
                           <Calendar size={12} className="opacity-30 group-hover:opacity-100" />
                           {record.timestamp}
+                        </div>
+                      </td>
+                      <td className="p-4">
+                        <div className="flex flex-col gap-1">
+                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border w-fit ${
+                            record.method === 'LOCAL' 
+                              ? 'border-green-500 text-green-500 bg-green-50' 
+                              : record.method === 'HYBRID'
+                              ? 'border-blue-500 text-blue-500 bg-blue-50'
+                              : 'border-purple-500 text-purple-500 bg-purple-50'
+                          }`}>
+                            {record.method || 'GEMINI'}
+                          </span>
+                          {record.method !== 'LOCAL' && record.aiModel && (
+                            <span className="text-[8px] uppercase tracking-tighter opacity-40">
+                              {record.aiModel}
+                            </span>
+                          )}
                         </div>
                       </td>
                       <td className="p-4">

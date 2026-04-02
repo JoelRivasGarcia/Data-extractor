@@ -7,6 +7,9 @@ export interface EquipmentRecord {
   timestamp: string;
   power: string;
   extractedAt: string;
+  method?: 'LOCAL' | 'GEMINI' | 'HYBRID';
+  aiModel?: string;
+  isNew?: boolean;
 }
 
 export interface ExtractionResult {
