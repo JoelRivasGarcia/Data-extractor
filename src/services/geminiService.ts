@@ -6,10 +6,11 @@ export async function extractEquipmentData(
   mimeType: string, 
   modelName: string = "gemini-3-flash-preview"
 ): Promise<{ result: ExtractionResult; model: string }> {
-  const apiKey = (import.meta as any).env?.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
+  // Use the exact pattern recommended in the skill
+  const apiKey = process.env.GEMINI_API_KEY;
   
-  if (!apiKey) {
-    throw new Error("Gemini API Key is missing.");
+  if (!apiKey || apiKey === "undefined") {
+    throw new Error("La llave de API de Gemini no está disponible. Por favor, asegúrate de que esté configurada en los secretos del proyecto.");
   }
 
   const ai = new GoogleGenAI({ apiKey });

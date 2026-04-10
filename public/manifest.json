@@ -1,0 +1,21 @@
+{
+  "name": "Optical Equipment Data Extractor",
+  "short_name": "OpticalData",
+  "description": "Professional tool for optical equipment data extraction and management.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#E4E3E0",
+  "theme_color": "#141414",
+  "icons": [
+    {
+      "src": "https://picsum.photos/seed/optical/192/192",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://picsum.photos/seed/optical/512/512",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

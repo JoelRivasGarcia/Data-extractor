@@ -10,6 +10,16 @@ export interface EquipmentRecord {
   method?: 'LOCAL' | 'GEMINI' | 'HYBRID';
   aiModel?: string;
   isNew?: boolean;
+  userId?: string;
+  projectId: string;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  createdAt: string;
+  createdBy: string;
+  status: 'active' | 'archived';
 }
 
 export interface ExtractionResult {

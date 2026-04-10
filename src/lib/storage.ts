@@ -8,6 +8,7 @@ export interface PendingUpload {
   id: string;
   blob: Blob;
   name: string;
+  timestamp: number;
 }
 
 export const storage = {
@@ -32,6 +33,11 @@ export const storage = {
   async getPendingUploads(): Promise<PendingUpload[]> {
     const uploads = await get<PendingUpload[]>(PENDING_KEY);
     return uploads || [];
+  },
+
+  async addPendingUpload(upload: PendingUpload): Promise<void> {
+    const uploads = await this.getPendingUploads();
+    await set(PENDING_KEY, [...uploads, upload]);
   },
 
   async removePendingUpload(id: string): Promise<void> {
