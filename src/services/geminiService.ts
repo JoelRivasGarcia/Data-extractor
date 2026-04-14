@@ -4,7 +4,7 @@ import { ExtractionResult } from "../types";
 export async function extractEquipmentData(
   base64Image: string, 
   mimeType: string, 
-  modelName: string = "gemini-3-flash-preview"
+  modelName: string = "gemini-flash-latest"
 ): Promise<{ result: ExtractionResult; model: string }> {
   // Use the exact pattern recommended in the skill
   const apiKey = process.env.GEMINI_API_KEY;
@@ -25,7 +25,7 @@ export async function extractEquipmentData(
         await new Promise(resolve => setTimeout(resolve, delay));
       }
 
-      const isNanoBanana = modelName.includes('2.5') || modelName.includes('image');
+      const isNanoBanana = modelName.includes('2.5') || modelName.includes('image') || modelName.includes('nano');
       
       const response = await ai.models.generateContent({
         model: modelName,
@@ -94,11 +94,14 @@ export async function extractEquipmentData(
       
       const isRateLimit = errorMessage.includes('429') || errorMessage.includes('quota');
       const isOverloaded = errorMessage.includes('503') || errorMessage.includes('high demand');
+      const isPermissionDenied = errorMessage.includes('403') || errorMessage.includes('permission');
       
       if (isRateLimit) {
         lastError = new Error("Límite de velocidad (RPM) o cuota diaria (RPD) excedida. Google permite pocas fotos por minuto en la versión gratuita. Espera 10 segundos e intenta de nuevo.");
       } else if (isOverloaded) {
         lastError = new Error("El servidor de Google está saturado en este momento. Reintentando en unos segundos...");
+      } else if (isPermissionDenied) {
+        lastError = new Error("Permiso denegado (403). Si estás en Netlify, recuerda que la llave interna de AI Studio no funciona fuera de su entorno. Debes usar OpenRouter o configurar tu propia llave de Gemini.");
       }
       
       if ((isRateLimit || isOverloaded) && attempt < maxRetries) {

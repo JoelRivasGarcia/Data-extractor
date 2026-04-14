@@ -24,20 +24,33 @@ export const FirebaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         const userDocRef = doc(db, 'users', user.uid);
         try {
           const userDoc = await getDoc(userDocRef);
+          const isMainAdmin = user.email === 'joelrivasgarciagy@gmail.com';
+          
           if (!userDoc.exists()) {
             const newUser = {
               uid: user.uid,
               email: user.email || '',
               displayName: user.displayName || '',
-              role: user.email === 'joelrivasgarciagy@gmail.com' ? 'admin' : 'technician'
+              role: isMainAdmin ? 'admin' : 'technician'
             };
             await setDoc(userDocRef, newUser);
             setIsAdmin(newUser.role === 'admin');
           } else {
-            setIsAdmin(userDoc.data()?.role === 'admin');
+            const data = userDoc.data();
+            // If it's the main admin but the database says technician, update it
+            if (isMainAdmin && data?.role !== 'admin') {
+              await setDoc(userDocRef, { ...data, role: 'admin' }, { merge: true });
+              setIsAdmin(true);
+            } else {
+              setIsAdmin(data?.role === 'admin' || isMainAdmin);
+            }
           }
         } catch (error) {
           console.error("Error fetching user profile:", error);
+          // Fallback for the main admin if database is unreachable
+          if (user.email === 'joelrivasgarciagy@gmail.com') {
+            setIsAdmin(true);
+          }
         }
       } else {
         setIsAdmin(false);

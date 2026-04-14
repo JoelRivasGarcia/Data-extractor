@@ -53,6 +53,7 @@ Return the result strictly in JSON format with the following keys: code, type, c
             ]
           }
         ],
+        max_tokens: 1000,
         response_format: { type: "json_object" }
       })
     });
@@ -91,7 +92,16 @@ export async function fetchOpenRouterModels(apiKey: string) {
     });
     if (!response.ok) throw new Error("Failed to fetch models");
     const data = await response.json();
-    return data.data; // Array of models
+    // Filter for models that support images (Vision models)
+    return data.data.filter((m: any) => 
+      m.id.toLowerCase().includes('vision') || 
+      m.id.toLowerCase().includes('vl') || 
+      m.id.toLowerCase().includes('pixtral') || 
+      m.id.toLowerCase().includes('gpt-4o') ||
+      m.id.toLowerCase().includes('gemini') ||
+      m.id.toLowerCase().includes('claude-3') ||
+      m.id.toLowerCase().includes('llava')
+    ); 
   } catch (error) {
     console.error("Error fetching models:", error);
     return [];
