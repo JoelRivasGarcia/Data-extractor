@@ -6,10 +6,12 @@ export async function extractEquipmentData(
   mimeType: string, 
   modelName: string = "gemini-flash-latest"
 ): Promise<{ result: ExtractionResult; model: string }> {
-  // Use the exact pattern recommended in the skill
-  const apiKey = process.env.GEMINI_API_KEY;
+  // Use the exact pattern recommended in the skill, with fallback for Netlify/Vercel
+  const apiKey = (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "undefined") 
+    ? process.env.GEMINI_API_KEY 
+    : (import.meta as any).env.VITE_GEMINI_API_KEY;
   
-  if (!apiKey || apiKey === "undefined") {
+  if (!apiKey) {
     throw new Error("La llave de API de Gemini no está disponible. Por favor, asegúrate de que esté configurada en los secretos del proyecto.");
   }
 
@@ -101,7 +103,7 @@ export async function extractEquipmentData(
       } else if (isOverloaded) {
         lastError = new Error("El servidor de Google está saturado en este momento. Reintentando en unos segundos...");
       } else if (isPermissionDenied) {
-        lastError = new Error("Permiso denegado (403). Si estás en Netlify, recuerda que la llave interna de AI Studio no funciona fuera de su entorno. Debes usar OpenRouter o configurar tu propia llave de Gemini.");
+        lastError = new Error("Permiso denegado (403). La llave de Gemini interna tiene restricciones de dominio y no funciona en vistas compartidas o externas. Por favor, usa OpenRouter en los Ajustes o configura tu propia llave de Gemini en el editor.");
       }
       
       if ((isRateLimit || isOverloaded) && attempt < maxRetries) {

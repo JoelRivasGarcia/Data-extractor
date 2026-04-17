@@ -47,20 +47,23 @@ import {
   Pencil
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import * as XLSX from 'xlsx';
+import { saveAs } from 'file-saver';
 import EXIF from 'exif-js';
 import Tesseract from 'tesseract.js';
-import { EquipmentRecord, Project, InventoryItem, KmzProject, TendidoItem, TendidoReport } from './types';
+import { EquipmentRecord, Project, InventoryItem, KmzProject, TendidoItem, TendidoReport, EquipmentRecordSummary, ProjectIndex } from './types';
 import { parseKmz, calculateDistance } from './services/kmzService';
 import { extractEquipmentData } from './services/geminiService';
 import { extractWithOpenRouter, fetchOpenRouterModels } from './services/openRouterService';
 import { storage, PendingUpload } from './lib/storage';
-import { auth, googleProvider, signInWithPopup, signOut, db, collection, query, where, onSnapshot, doc, setDoc, limit, getDocs } from './firebase';
+import { compressImage, getImageHash } from './lib/utils';
+import { auth, googleProvider, signInWithPopup, signOut, db, collection, query, where, onSnapshot, doc, setDoc, getDoc, limit, getDocs, writeBatch, arrayUnion, arrayRemove, deleteDoc } from './firebase';
 import { useAuth, handleFirestoreError, OperationType } from './FirebaseProvider';
-import { deleteDoc } from 'firebase/firestore';
 
 export default function App() {
-  const { user, loading: authLoading, isAdmin } = useAuth();
+  const { user, loading: authLoading, isAdmin, quotaExceeded, setQuotaExceeded } = useAuth();
   const [records, setRecords] = useState<EquipmentRecord[]>([]);
+  const [displayLimit, setDisplayLimit] = useState(20);
   const [isInitialLoad, setIsInitialLoad] = useState(true);
   const [isUploading, setIsUploading] = useState(false);
   const [isResuming, setIsResuming] = useState(false);
@@ -82,6 +85,7 @@ export default function App() {
     failed: { name: string; error: string }[];
   } | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
   const [currentProjectId, setCurrentProjectId] = useState<string | null>(localStorage.getItem('currentProjectId'));
   const [isCreatingProject, setIsCreatingProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
@@ -174,7 +178,7 @@ export default function App() {
   }, [kmzProject, tendidoReports, currentProjectId]);
 
   useEffect(() => {
-    if (authLoading || !user || !isAdmin) return;
+    if (authLoading || !user || !isAdmin || !projectsLoaded) return;
 
     const syncLocalProjects = async () => {
       for (let i = 0; i < localStorage.length; i++) {
@@ -214,44 +218,216 @@ export default function App() {
     syncLocalProjects();
   }, [user, isAdmin, projects, authLoading]);
 
+  // 3. Consolidated Cloud Synchronization
   useEffect(() => {
-    if (authLoading || !user || !currentProjectId) return;
+    let unsubscribe: (() => void) | undefined;
+    
+    if (authLoading || !user || !currentProjectId) {
+      if (!currentProjectId) {
+        setRecords([]);
+        setIsInitialLoad(false);
+      }
+      return;
+    }
 
-    const syncLocalRecords = async () => {
+    const syncRecords = async () => {
       try {
-        // 1. Try to migrate from old localStorage key first
-        const migratedRecords = await storage.migrateFromLocalStorage();
-        if (migratedRecords && migratedRecords.length > 0) {
-          console.log(`Migrated ${migratedRecords.length} records from localStorage to IndexedDB.`);
+        // 1. Load from cache first
+        const localRecords = await storage.loadRecords(currentProjectId);
+        if (localRecords.length > 0) {
+          setRecords(localRecords);
+          setIsInitialLoad(false);
         }
 
-        // 2. Load all local records from IndexedDB
-        const localRecords = await storage.loadRecords();
-        if (localRecords.length > 0) {
-          console.log(`Found ${localRecords.length} local records. Syncing to cloud...`);
-          for (const record of localRecords) {
-            const updatedRecord = {
-              ...record,
-              projectId: record.projectId || currentProjectId,
-              userId: record.userId || user.uid
-            };
-            
-            try {
-              await setDoc(doc(db, 'records', updatedRecord.id), updatedRecord, { merge: true });
-            } catch (e) {
-              console.error("Error syncing local record:", e);
-            }
-          }
-          // Clear local storage after successful sync attempt
-          await storage.saveRecords([]); 
+        // 2. Optimized Fetch using the INDEX (Bucket Pattern)
+        // First, check if there's a project index for this project
+        const indexDoc = await getDoc(doc(db, 'project_indexes', currentProjectId));
+        if (indexDoc.exists()) {
+          const indexData = indexDoc.data() as ProjectIndex;
+          console.log(`Loading ${indexData.items.length} records from index bucket.`);
+          
+          const indexRecords: EquipmentRecord[] = indexData.items.map(item => ({
+            ...item,
+            timestamp: item.extractedAt,
+            projectId: currentProjectId,
+            imageUrl: undefined
+          } as EquipmentRecord));
+
+          setRecords(prev => {
+            const combined = [...prev];
+            indexRecords.forEach(ir => {
+              const exists = combined.some(r => r.id === ir.id);
+              if (!exists) combined.push(ir);
+            });
+            storage.saveRecords(currentProjectId, combined);
+            return combined;
+          });
         }
+
+        // 3. Incremental sync for live updates (limited to prevent massive reads)
+        const lastSync = await storage.getLastSync(currentProjectId);
+        
+        let q = query(
+          collection(db, 'records'), 
+          where('projectId', '==', currentProjectId),
+          limit(200) // Safety limit: only sync the latest 200 records in real-time
+        );
+
+        if (!isAdmin) {
+          q = query(q, where('userId', '==', user.uid));
+        }
+        
+        if (lastSync) {
+          q = query(q, where('extractedAt', '>', lastSync));
+        }
+
+        unsubscribe = onSnapshot(q, (snapshot) => {
+          let hasChanges = false;
+          let latestTimestamp = lastSync || '';
+
+          setRecords(prev => {
+            let newRecords = [...prev];
+            
+            snapshot.docChanges().forEach((change: any) => {
+              const data = change.doc.data() as EquipmentRecord;
+              hasChanges = true;
+              
+              if (data.extractedAt > latestTimestamp) {
+                latestTimestamp = data.extractedAt;
+              }
+
+              if (change.type === 'removed') {
+                newRecords = newRecords.filter(r => r.id !== data.id);
+              } else {
+                const index = newRecords.findIndex(r => r.id === data.id);
+                if (index >= 0) {
+                  newRecords[index] = data;
+                } else {
+                  newRecords.push(data);
+                }
+              }
+            });
+
+            if (hasChanges) {
+              const filtered = newRecords.filter(r => r.projectId === currentProjectId);
+              storage.saveRecords(currentProjectId, filtered);
+              if (latestTimestamp) {
+                storage.setLastSync(currentProjectId, latestTimestamp);
+              }
+              return filtered;
+            }
+            return prev;
+          });
+          
+          setIsInitialLoad(false);
+        }, (error) => {
+          if (error.message?.includes('quota')) {
+            setQuotaExceeded(true);
+            console.warn("Quota exceeded, switching to local mode.");
+          } else {
+            handleFirestoreError(error, OperationType.LIST, 'records');
+          }
+        });
       } catch (e) {
-        console.error("Error in syncLocalRecords:", e);
+        console.error("Error en syncRecords:", e);
       }
     };
 
-    syncLocalRecords();
+    syncRecords();
+
+    return () => {
+      if (unsubscribe) {
+        unsubscribe();
+      }
+    };
+  }, [user, authLoading, currentProjectId, isAdmin]);
+
+  // 4. Sync Tendido Reports
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    
+    if (authLoading || !user || !currentProjectId) {
+      if (!currentProjectId) setTendidoReports([]);
+      return;
+    }
+
+    const syncReports = () => {
+      try {
+        const q = query(
+          collection(db, 'tendido_reports'),
+          where('projectId', '==', currentProjectId)
+        );
+
+        unsubscribe = onSnapshot(q, (snapshot) => {
+          const reports: TendidoReport[] = [];
+          snapshot.forEach((doc) => {
+            reports.push(doc.data() as TendidoReport);
+          });
+          
+          // Sort locally by timestamp newest first
+          reports.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+          
+          setTendidoReports(reports);
+          localStorage.setItem(`tendidoReports_${currentProjectId}`, JSON.stringify(reports));
+        }, (error) => {
+          if (error.message?.includes('quota')) {
+            setQuotaExceeded(true);
+            console.warn("Quota exceeded in reports, using cache.");
+          } else {
+            console.error("Firestore Error in reports:", error);
+            // Optionally handle this silently if it's just a permission issue
+          }
+        });
+      } catch (e) {
+        console.error("Error syncing tendido reports:", e);
+      }
+    };
+
+    syncReports();
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
   }, [user, authLoading, currentProjectId]);
+
+  // 5. Sync KMZ Project Data (Items & Tendidos)
+  useEffect(() => {
+    if (authLoading || !user || !currentProjectId) {
+      // Don't clear if we're parsing or just uploaded
+      if (!currentProjectId && !isParsingKmz) {
+        setKmzProject(null);
+      }
+      return;
+    }
+
+    const loadProjectData = async () => {
+      // 1. Try local storage first
+      const saved = localStorage.getItem(`kmzProject_${currentProjectId}`);
+      if (saved) {
+        setKmzProject(JSON.parse(saved));
+      }
+
+      // 2. Fetch from Cloud always to ensure latest version (1 read)
+      try {
+        const docSnap = await getDoc(doc(db, 'kmz_projects', currentProjectId));
+        if (docSnap.exists()) {
+          const cloudData = docSnap.data() as KmzProject;
+          setKmzProject(cloudData);
+          localStorage.setItem(`kmzProject_${currentProjectId}`, JSON.stringify(cloudData));
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message.includes('quota')) {
+          setQuotaExceeded(true);
+        } else {
+          console.error("Error loading KMZ project from cloud:", error);
+        }
+      }
+    };
+
+    if (!isParsingKmz) {
+      loadProjectData();
+    }
+  }, [user, authLoading, currentProjectId, isParsingKmz]);
 
   const requestNotificationPermission = async () => {
     if (!("Notification" in window)) return;
@@ -301,7 +477,7 @@ export default function App() {
       if (err.code === 'auth/popup-blocked') {
         setError("El navegador bloqueó la ventana emergente. Por favor, permite las ventanas emergentes para este sitio.");
       } else if (err.code === 'auth/unauthorized-domain') {
-        setError("Dominio no autorizado. Debes añadir la URL de Netlify en la Consola de Firebase > Authentication > Settings > Authorized domains.");
+        setError("Dominio no autorizado. Si estás usando una URL compartida o de vista previa, debes añadir este dominio en la Consola de Firebase > Authentication > Settings > Authorized domains.");
       } else if (err.code === 'auth/cancelled-popup-request') {
         // User closed the popup, no need to show error
       } else {
@@ -313,6 +489,28 @@ export default function App() {
   };
 
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [loadingImages, setLoadingImages] = useState<Set<string>>(new Set());
+
+  const fetchRecordImage = async (recordId: string) => {
+    if (loadingImages.has(recordId)) return;
+    
+    setLoadingImages(prev => new Set(prev).add(recordId));
+    try {
+      const imgDoc = await getDoc(doc(db, 'record_images', recordId));
+      if (imgDoc.exists()) {
+        const data = imgDoc.data();
+        setRecords(prev => prev.map(r => r.id === recordId ? { ...r, imageUrl: data.imageUrl } : r));
+      }
+    } catch (error) {
+      console.error("Error loading image:", error);
+    } finally {
+      setLoadingImages(prev => {
+        const next = new Set(prev);
+        next.delete(recordId);
+        return next;
+      });
+    }
+  };
   const [editValues, setEditValues] = useState<{ code: string; coordinates: string }>({ code: '', coordinates: '' });
 
   useEffect(() => {
@@ -346,105 +544,30 @@ export default function App() {
       return;
     }
 
-    const q = query(collection(db, 'projects'), where('status', '==', 'active'));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const projectsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Project));
-      setProjects(projectsData);
-      
-      // If current project is not in the list anymore, don't delete it immediately
-      // It might be a local project that needs to be synced to the cloud
-      if (currentProjectId && !projectsData.find(p => p.id === currentProjectId)) {
-        console.log("Project not found in cloud, might be local:", currentProjectId);
+    const fetchProjects = async () => {
+      try {
+        const q = query(collection(db, 'projects'), where('status', '==', 'active'));
+        const snapshot = await getDocs(q);
+        const projectsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Project));
+        setProjects(projectsData);
+        setProjectsLoaded(true);
+        
+        if (currentProjectId && !projectsData.find(p => p.id === currentProjectId)) {
+          console.log("Project not found in cloud, might be local:", currentProjectId);
+        }
+        
+        if (!currentProjectId && projectsData.length > 0) {
+          setCurrentProjectId(projectsData[0].id);
+          localStorage.setItem('currentProjectId', projectsData[0].id);
+        }
+      } catch (error) {
+        handleFirestoreError(error, OperationType.LIST, 'projects');
       }
-      
-      // Auto-select first project if none selected and we don't have a local one
-      if (!currentProjectId && projectsData.length > 0) {
-        setCurrentProjectId(projectsData[0].id);
-        localStorage.setItem('currentProjectId', projectsData[0].id);
-      }
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'projects');
-    });
+    };
 
-    return () => unsubscribe();
+    fetchProjects();
   }, [user, authLoading]);
 
-  useEffect(() => {
-    if (authLoading) return;
-    if (!user) {
-      setRecords([]);
-      setIsInitialLoad(false);
-      return;
-    }
-
-    if (!currentProjectId) {
-      setRecords([]);
-      setIsInitialLoad(false);
-      return;
-    }
-
-    // Fetch records for the current project
-    const q = query(
-      collection(db, 'records'), 
-      where('projectId', '==', currentProjectId)
-    );
-    
-    // Deep recovery: Fetch recent records for this user to find orphans or mislinked photos
-    const recoveryQ = query(
-      collection(db, 'records'),
-      where('userId', '==', user.uid),
-      limit(1000) // Check last 1000 photos for recovery
-    );
-
-    const syncRecords = (snapshot: any) => {
-      const recordsToUpdate: { ref: any, data: any }[] = [];
-      
-      setRecords(prev => {
-        const newRecords = [...prev];
-        snapshot.forEach((doc: any) => {
-          const data = doc.data() as EquipmentRecord;
-          const index = newRecords.findIndex(r => r.id === data.id);
-          
-          // Recovery logic: If record has no project OR project doesn't exist in cloud
-          // ONLY run this if projects have been loaded to avoid false positives
-          const projectExists = projects.some(p => p.id === data.projectId);
-          if (projects.length > 0 && currentProjectId && (!data.projectId || !projectExists)) {
-            console.log("Found record to recover:", data.id);
-            recordsToUpdate.push({ ref: doc.ref, data: { ...data, projectId: currentProjectId } });
-            data.projectId = currentProjectId;
-          }
-
-          if (index >= 0) {
-            newRecords[index] = data;
-          } else {
-            newRecords.push(data);
-          }
-        });
-        // Only show records for the current project in the UI
-        return newRecords.filter(r => r.projectId === currentProjectId);
-      });
-
-      // Perform updates outside of state setter
-      recordsToUpdate.forEach(({ ref, data }) => {
-        setDoc(ref, data, { merge: true }).catch(err => console.error("Error recovering record:", err));
-      });
-
-      setIsInitialLoad(false);
-    };
-
-    const unsubscribe = onSnapshot(q, (snapshot) => syncRecords(snapshot), (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'records');
-    });
-
-    const unsubscribeRecovery = onSnapshot(recoveryQ, (snapshot) => syncRecords(snapshot), (error) => {
-      console.warn("Recovery fetch error:", error);
-    });
-
-    return () => {
-      unsubscribe();
-      unsubscribeRecovery();
-    };
-  }, [user, authLoading, currentProjectId, projects]);
 
   useEffect(() => {
     const initPending = async () => {
@@ -465,7 +588,9 @@ export default function App() {
     
     const saveToStorage = async () => {
       try {
-        await storage.saveRecords(records);
+        if (currentProjectId) {
+          await storage.saveRecords(currentProjectId, records);
+        }
       } catch (err) {
         console.error('Error saving to IndexedDB:', err);
         setError('Error al guardar los datos. Es posible que el almacenamiento del navegador esté lleno.');
@@ -532,13 +657,57 @@ export default function App() {
     setIsParsingKmz(true);
     try {
       const { name, items, tendidos } = await parseKmz(file);
+      
+      // Check if project with same name exists to reuse ID and keep photos linked
+      const existingProject = projects.find(p => p.name.toUpperCase() === name.toUpperCase());
+      const newProjectId = existingProject ? existingProject.id : crypto.randomUUID();
+      
+      // Prevent useEffect from overwriting the fresh upload with empty localStorage
+      isKmzInitialLoad.current = false;
+      lastProjectId.current = newProjectId;
+
       setKmzProject({
-        id: crypto.randomUUID(),
+        id: newProjectId,
         name,
         items,
         tendidos,
         uploadedAt: new Date().toISOString()
       });
+      
+      setCurrentProjectId(newProjectId);
+      localStorage.setItem('currentProjectId', newProjectId);
+      localStorage.setItem(`kmzProject_${newProjectId}`, JSON.stringify({
+        id: newProjectId,
+        name,
+        items,
+        tendidos,
+        uploadedAt: new Date().toISOString()
+      }));
+
+      // Save project metadata and KMZ structure to Firestore
+      if (user) {
+        const newProject: Project = {
+          id: newProjectId,
+          name,
+          createdAt: new Date().toISOString(),
+          createdBy: user.uid,
+          status: 'active'
+        };
+        
+        // Use a batch to ensure both are saved or none
+        const batch = writeBatch(db);
+        batch.set(doc(db, 'projects', newProjectId), newProject);
+        batch.set(doc(db, 'kmz_projects', newProjectId), {
+          id: newProjectId,
+          name,
+          items,
+          tendidos,
+          uploadedAt: new Date().toISOString()
+        });
+        
+        await batch.commit();
+      }
+
       setActiveTab('INVENTORY');
     } catch (err) {
       console.error("Error parsing KMZ:", err);
@@ -625,8 +794,16 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const deleteReport = (id: string) => {
-    setTendidoReports(prev => prev.filter(r => r.id !== id));
+  const deleteReport = async (id: string) => {
+    if (user) {
+      try {
+        await deleteDoc(doc(db, 'tendido_reports', id));
+      } catch (error) {
+        handleFirestoreError(error, OperationType.DELETE, `tendido_reports/${id}`);
+      }
+    } else {
+      setTendidoReports(prev => prev.filter(r => r.id !== id));
+    }
   };
 
   const startEditingTendido = (tendido: TendidoItem) => {
@@ -645,47 +822,63 @@ export default function App() {
     setEditingTendidoId(null);
   };
 
-  const saveReport = () => {
-    if (!newReport.tendidoId || newReport.startMeter === undefined || newReport.endMeter === undefined) return;
+  const saveReport = async () => {
+    if (!newReport.tendidoId || newReport.startMeter === undefined || newReport.endMeter === undefined || !currentProjectId) return;
     
-    if (editingReportId) {
-      setTendidoReports(prev => prev.map(r => 
-        r.id === editingReportId ? {
-          ...r,
+    try {
+      if (editingReportId) {
+        const report = tendidoReports.find(r => r.id === editingReportId);
+        if (!report) return;
+
+        const updatedReport: TendidoReport = {
+          ...report,
           tendidoId: newReport.tendidoId!,
           startMeter: newReport.startMeter!,
           endMeter: newReport.endMeter!,
           hardware: newReport.hardware as any,
           notes: newReport.notes,
-          technician: newReport.technician || r.technician
-        } : r
-      ));
-      setEditingReportId(null);
-    } else {
-      const report: TendidoReport = {
-        id: crypto.randomUUID(),
-        tendidoId: newReport.tendidoId,
-        startMeter: newReport.startMeter,
-        endMeter: newReport.endMeter,
-        hardware: newReport.hardware as any,
-        notes: newReport.notes,
-        timestamp: new Date().toISOString(),
-        technician: user?.displayName || user?.email || 'Técnico'
-      };
+          technician: newReport.technician || report.technician
+        };
 
-      setTendidoReports(prev => [...prev, report]);
-      setShowReportSummary(report);
+        if (user) {
+          await setDoc(doc(db, 'tendido_reports', editingReportId), updatedReport);
+        } else {
+          setTendidoReports(prev => prev.map(r => r.id === editingReportId ? updatedReport : r));
+        }
+        setEditingReportId(null);
+      } else {
+        const report: TendidoReport = {
+          id: crypto.randomUUID(),
+          projectId: currentProjectId,
+          tendidoId: newReport.tendidoId,
+          startMeter: newReport.startMeter,
+          endMeter: newReport.endMeter,
+          hardware: newReport.hardware as any,
+          notes: newReport.notes,
+          timestamp: new Date().toISOString(),
+          technician: user?.displayName || user?.email || 'Técnico'
+        };
+
+        if (user) {
+          await setDoc(doc(db, 'tendido_reports', report.id), report);
+        } else {
+          setTendidoReports(prev => [report, ...prev]);
+        }
+        setShowReportSummary(report);
+      }
+
+      setNewReport({
+        hardware: { 
+          cintaBandi: 0, hevillas: 0, etiquetas: 0, alambre: 0, mensajero: 0, 
+          cruceta: 0, brazoCruceta: 0, grillete: 0, chapas: 0, clevi: 0, 
+          preformado: 0, brazo060: 0, brazo1m: 0, otros: '' 
+        },
+        notes: '',
+        technician: user?.displayName || user?.email || ''
+      });
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, 'tendido_reports');
     }
-
-    setNewReport({
-      hardware: { 
-        cintaBandi: 0, hevillas: 0, etiquetas: 0, alambre: 0, mensajero: 0, 
-        cruceta: 0, brazoCruceta: 0, grillete: 0, chapas: 0, clevi: 0, 
-        preformado: 0, brazo060: 0, brazo1m: 0, otros: '' 
-      },
-      notes: '',
-      technician: user?.displayName || user?.email || ''
-    });
   };
 
   const uniqueCeldas = useMemo(() => {
@@ -778,6 +971,22 @@ export default function App() {
       return matchesSearch && matchesType;
     })
     .sort((a, b) => {
+      // Prioritize newly added items if in NEWEST mode
+      if (sortOrder === 'NEWEST') {
+        const aIsNew = newlyAddedIds.has(a.id);
+        const bIsNew = newlyAddedIds.has(b.id);
+        if (aIsNew && !bIsNew) return -1;
+        if (!aIsNew && bIsNew) return 1;
+        // If both are new or both are not, sort by extractedAt descending
+        const bTime = b.extractedAt ? new Date(b.extractedAt).getTime() : 0;
+        const aTime = a.extractedAt ? new Date(a.extractedAt).getTime() : 0;
+        return (isNaN(bTime) ? 0 : bTime) - (isNaN(aTime) ? 0 : aTime);
+      }
+      if (sortOrder === 'OLDEST') {
+        const bTime = b.extractedAt ? new Date(b.extractedAt).getTime() : 0;
+        const aTime = a.extractedAt ? new Date(a.extractedAt).getTime() : 0;
+        return (isNaN(aTime) ? 0 : aTime) - (isNaN(bTime) ? 0 : bTime);
+      }
       if (sortOrder === 'SERIAL_ASC') return (a.code || '').localeCompare(b.code || '');
       if (sortOrder === 'SERIAL_DESC') return (b.code || '').localeCompare(a.code || '');
       if (sortOrder === 'POWER_ASC') return extractPowerValue(a.power || '') - extractPowerValue(b.power || '');
@@ -785,8 +994,12 @@ export default function App() {
       return 0;
     });
 
-  // Handle NEWEST/OLDEST by reversing if needed (since state is prepended)
-  const sortedRecords = sortOrder === 'OLDEST' ? [...filteredRecords].reverse() : filteredRecords;
+  // sortedRecords is now handled by the sort above for NEWEST/OLDEST
+  const sortedRecords = filteredRecords;
+
+  const paginatedRecords = useMemo(() => {
+    return sortedRecords.slice(0, displayLimit);
+  }, [sortedRecords, displayLimit]);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -998,6 +1211,7 @@ export default function App() {
     if (!isResumingBatch) {
       setUploadSummary(null);
       setNewlyAddedIds(new Set());
+      setSortOrder('NEWEST');
     }
     setUploadProgress({ current: 0, total: items.length });
 
@@ -1011,12 +1225,16 @@ export default function App() {
       const batch = items.slice(i, i + batchSize);
       
       const batchPromises = batch.map(async (item) => {
-        const file = 'blob' in item ? new File([item.blob], item.name, { type: item.blob.type }) : item;
+        const originalFile = 'blob' in item ? new File([item.blob], item.name, { type: item.blob.type }) : item;
         const itemId = 'id' in item ? item.id : null;
 
         try {
+          // 0. Compress image before anything else to save storage/bandwidth
+          const compressedBlob = await compressImage(originalFile);
+          const file = new File([compressedBlob], originalFile.name, { type: 'image/jpeg' });
+          
           // 1. Try Local Extraction (EXIF + OCR)
-          const exif = await getExifData(file);
+          const exif = await getExifData(originalFile); // Use original for EXIF
           const ocrText = await runLocalOCR(file);
           
           let localData = {
@@ -1034,83 +1252,98 @@ export default function App() {
 
           // 2. Fallback to Gemini if local is incomplete or invalid
           if (!validation.isValid) {
-            // Check if offline - if so, save to pending and skip Gemini
-            if (!isOnline) {
-              if (!itemId) {
-                await storage.addPendingUpload({
-                  id: crypto.randomUUID(),
-                  name: file.name,
-                  blob: file,
-                  timestamp: Date.now()
-                });
-              }
-              throw new Error("Offline: Foto guardada en cola para procesar con IA cuando haya internet.");
-            }
-
-            // Wait for rate limiter (max 1 request every 8 seconds to stay under 7-8 RPM free tier)
-            const now = Date.now();
-            const timeSinceLastCall = now - (window as any).lastGeminiCall || 0;
-            const minDelay = 8000; 
-            if (timeSinceLastCall < minDelay) {
-              await new Promise(resolve => setTimeout(resolve, minDelay - timeSinceLastCall));
-            }
-            (window as any).lastGeminiCall = Date.now();
-
-            const resizedBase64 = await resizeImage(file);
-            
             let geminiResult = null;
-            let usedModel = selectedModel;
-
-            const tryModel = async (model: string, label: string) => {
-              try {
-                if (model.startsWith('openrouter/')) {
-                  if (!openRouterKey) {
-                    throw new Error("API Key de OpenRouter no configurada en Ajustes.");
-                  }
-                  const { result } = await extractWithOpenRouter(resizedBase64, 'image/jpeg', model.replace('openrouter/', ''), openRouterKey);
-                  return { result, label };
-                } else {
-                  const { result } = await extractEquipmentData(resizedBase64, 'image/jpeg', model);
-                  return { result, label };
-                }
-              } catch (err: any) {
-                const msg = err.message?.toLowerCase() || "";
-                const isRetryable = msg.includes('429') || msg.includes('quota') || msg.includes('503') || msg.includes('limit') || msg.includes('overloaded') || msg.includes('not found');
-                return { error: err, retryable: isRetryable };
-              }
-            };
-
-            const models = [
-              { id: "gemini-flash-latest", label: "Gemini Flash (Estable)" },
-              { id: "gemini-3.1-flash-lite-preview", label: "Gemini Lite" },
-              { id: "openrouter/qwen/qwen-2.5-72b-instruct", label: "Qwen 2.5 72B" }
-            ];
-
-            // If we have an OpenRouter key, we can fallback to OpenRouter models too
-            const otherModels = models.filter(m => m.id !== selectedModel);
+            let usedModel = "";
             
-            let extraction = await tryModel(selectedModel, models.find(m => m.id === selectedModel)?.label || selectedModel);
+            // Check Gemini Cache first to avoid API call
+            const imageHash = getImageHash(originalFile);
+            const cachedResult = await storage.getGeminiCache(imageHash);
             
-            // Fallback logic: if the primary model fails, try the others
-            if (extraction.error && extraction.retryable) {
-              for (const model of otherModels) {
-                // If it's an OpenRouter model, we need the key
-                if (model.id.startsWith('openrouter/') && !openRouterKey) continue;
-                
-                console.warn(`${usedModel} falló. Probando respaldo: ${model.label}...`);
-                extraction = await tryModel(model.id, model.label);
-                if (extraction.result) {
-                  usedModel = extraction.label || model.label;
-                  break;
-                }
-              }
-            }
-
-            if (extraction.result) {
-              geminiResult = extraction.result;
-              usedModel = extraction.label || "Gemini";
+            if (cachedResult) {
+              console.log("Using cached Gemini result for:", originalFile.name);
+              geminiResult = cachedResult.result;
+              usedModel = cachedResult.model || "Cache";
             } else {
-              throw extraction.error || new Error("No se pudo procesar con ninguna versión de IA");
+              // Check if offline - if so, save to pending and skip Gemini
+              if (!isOnline) {
+                if (!itemId) {
+                  await storage.addPendingUpload({
+                    id: crypto.randomUUID(),
+                    name: file.name,
+                    blob: file,
+                    timestamp: Date.now()
+                  });
+                }
+                throw new Error("Offline: Foto guardada en cola para procesar con IA cuando haya internet.");
+              }
+
+              // Wait for rate limiter (max 1 request every 8 seconds to stay under 7-8 RPM free tier)
+              const now = Date.now();
+              const timeSinceLastCall = now - (window as any).lastGeminiCall || 0;
+              const minDelay = 8000; 
+              if (timeSinceLastCall < minDelay) {
+                await new Promise(resolve => setTimeout(resolve, minDelay - timeSinceLastCall));
+              }
+              (window as any).lastGeminiCall = Date.now();
+
+              const resizedBase64 = await resizeImage(file);
+              
+              let usedModelId = selectedModel;
+
+              const tryModel = async (model: string, label: string) => {
+                try {
+                  if (model.startsWith('openrouter/')) {
+                    if (!openRouterKey) {
+                      throw new Error("API Key de OpenRouter no configurada en Ajustes.");
+                    }
+                    const { result } = await extractWithOpenRouter(resizedBase64, 'image/jpeg', model.replace('openrouter/', ''), openRouterKey);
+                    return { result, label };
+                  } else {
+                    const { result } = await extractEquipmentData(resizedBase64, 'image/jpeg', model);
+                    return { result, label };
+                  }
+                } catch (err: any) {
+                  const msg = err.message?.toLowerCase() || "";
+                  const isRetryable = msg.includes('429') || msg.includes('quota') || msg.includes('503') || msg.includes('limit') || msg.includes('overloaded') || msg.includes('not found');
+                  return { error: err, retryable: isRetryable };
+                }
+              };
+
+              const models = [
+                { id: "gemini-flash-latest", label: "Gemini Flash (Estable)" },
+                { id: "gemini-3.1-flash-lite-preview", label: "Gemini Lite" },
+                { id: "openrouter/qwen/qwen-2.5-72b-instruct", label: "Qwen 2.5 72B" }
+              ];
+
+              // If we have an OpenRouter key, we can fallback to OpenRouter models too
+              const otherModels = models.filter(m => m.id !== selectedModel);
+              
+              let extraction = await tryModel(selectedModel, models.find(m => m.id === selectedModel)?.label || selectedModel);
+              
+              // Fallback logic: if the primary model fails, try the others
+              if (extraction.error && extraction.retryable) {
+                for (const model of otherModels) {
+                  // If it's an OpenRouter model, we need the key
+                  if (model.id.startsWith('openrouter/') && !openRouterKey) continue;
+                  
+                  console.warn(`${usedModelId} falló. Probando respaldo: ${model.label}...`);
+                  extraction = await tryModel(model.id, model.label);
+                  if (extraction.result) {
+                    usedModelId = model.id;
+                    usedModel = extraction.label || model.label;
+                    break;
+                  }
+                }
+              }
+
+              if (extraction.result) {
+                geminiResult = extraction.result;
+                usedModel = extraction.label || "Gemini";
+                // Save to local cache
+                await storage.saveGeminiCache(imageHash, { result: geminiResult, model: usedModel });
+              } else {
+                throw extraction.error || new Error("No se pudo procesar con ninguna versión de IA");
+              }
             }
 
             if (geminiResult) {
@@ -1138,7 +1371,7 @@ export default function App() {
             coordinates: finalData.coordinates || '0,0',
             timestamp: finalData.timestamp || new Date().toLocaleString(),
             power: finalData.power || 'N/A',
-            extractedAt: new Date().toLocaleString(),
+            extractedAt: new Date().toISOString(),
             method: extractionMethod,
             aiModel: (finalData as any).aiModel || (extractionMethod === 'LOCAL' ? 'N/A' : 'Gemini 3'),
             projectId: currentProjectId,
@@ -1147,10 +1380,35 @@ export default function App() {
 
           if (user) {
             try {
-              // We don't save isNew to Firestore, it's a local UI state
-              await setDoc(doc(db, 'records', newRecord.id), newRecord);
+              const batch = writeBatch(db);
+              
+              // 1. Heavy image in its own collection
+              batch.set(doc(db, 'record_images', newRecord.id), { imageUrl: resizedBase64 });
+              
+              // 2. Metadata without photo in records collection
+              const { imageUrl, ...metadata } = newRecord;
+              batch.set(doc(db, 'records', newRecord.id), metadata);
+              
+              // 3. Update the Project Index (The BUCKET pattern)
+              // This single write adds a small metadata summary to the index document
+              const summary: EquipmentRecordSummary = {
+                id: newRecord.id,
+                code: newRecord.code,
+                type: newRecord.type,
+                coordinates: newRecord.coordinates,
+                power: newRecord.power,
+                extractedAt: newRecord.extractedAt
+              };
+              
+              batch.set(doc(db, 'project_indexes', currentProjectId), {
+                projectId: currentProjectId,
+                lastUpdated: new Date().toISOString(),
+                items: arrayUnion(summary)
+              }, { merge: true });
+
+              await batch.commit();
             } catch (error) {
-              handleFirestoreError(error, OperationType.WRITE, `records/${newRecord.id}`);
+              handleFirestoreError(error, OperationType.WRITE, `records_batch/${newRecord.id}`);
             }
           }
           
@@ -1162,9 +1420,10 @@ export default function App() {
           }
           return newRecord;
         } catch (err) {
-          console.error(`Error processing ${file.name}:`, err);
+          const fileName = 'name' in item ? item.name : (item as File).name;
+          console.error(`Error processing ${fileName}:`, err);
           failed.push({ 
-            name: file.name, 
+            name: fileName, 
             error: err instanceof Error ? err.message : 'Error desconocido' 
           });
           return null;
@@ -1259,9 +1518,29 @@ export default function App() {
   };
 
   const deleteRecord = async (id: string) => {
-    if (user) {
+    if (user && currentProjectId) {
       try {
-        await deleteDoc(doc(db, 'records', id));
+        const batch = writeBatch(db);
+        const record = records.find(r => r.id === id);
+        
+        batch.delete(doc(db, 'records', id));
+        batch.delete(doc(db, 'record_images', id));
+        
+        if (record) {
+          const summary: EquipmentRecordSummary = {
+            id: record.id,
+            code: record.code,
+            type: record.type,
+            coordinates: record.coordinates,
+            power: record.power,
+            extractedAt: record.extractedAt
+          };
+          batch.update(doc(db, 'project_indexes', currentProjectId), {
+            items: arrayRemove(summary)
+          });
+        }
+        
+        await batch.commit();
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, `records/${id}`);
       }
@@ -1273,9 +1552,28 @@ export default function App() {
   const deleteFilteredRecords = async () => {
     const filteredIds = filteredRecords.map(r => r.id);
     
-    if (user) {
+    if (user && currentProjectId) {
       try {
-        await Promise.all(filteredIds.map(id => deleteDoc(doc(db, 'records', id))));
+        const batch = writeBatch(db);
+        
+        filteredIds.forEach(id => {
+          batch.delete(doc(db, 'records', id));
+          batch.delete(doc(db, 'record_images', id));
+        });
+
+        // Update Project Index efficiently by removing all filtered items
+        const indexDoc = await getDoc(doc(db, 'project_indexes', currentProjectId));
+        if (indexDoc.exists()) {
+          const indexData = indexDoc.data() as ProjectIndex;
+          const remainingItems = indexData.items.filter(item => !filteredIds.includes(item.id));
+          batch.update(doc(db, 'project_indexes', currentProjectId), {
+            items: remainingItems,
+            lastUpdated: new Date().toISOString()
+          });
+        }
+        
+        await batch.commit();
+        setRecords(prev => prev.filter(r => !filteredIds.includes(r.id)));
       } catch (error) {
         handleFirestoreError(error, OperationType.DELETE, 'multiple records');
       }
@@ -1283,7 +1581,6 @@ export default function App() {
       setRecords(prev => prev.filter(r => !filteredIds.includes(r.id)));
     }
     
-    // If not filtered, we are deleting everything, so clear pending too
     if (!isFiltered) {
       await storage.clearPendingUploads();
     }
@@ -1296,55 +1593,104 @@ export default function App() {
   const exportToCSV = () => {
     if (!kmzProject) return;
     
-    const headers = [
-      'TIPO', 'NOMBRE/CÓDIGO', 'ESTADO', 'CELDA', 'COORDENADAS / DISTANCIA', 'FECHA CARGA'
-    ];
-
-    const rows: string[][] = [];
-
-    // 1. Add Inventory Items (EQUIPOS)
-    kmzProject.items.forEach(item => {
-      rows.push([
-        item.type,
-        item.name,
-        item.status === 'INSTALLED' ? 'COMPLETO' : 'INCOMPLETO',
-        item.celda || 'N/A',
-        `${item.coordinates.lat}, ${item.coordinates.lng}`,
-        kmzProject.uploadedAt
-      ]);
+    // --- SHEET 1: EQUIPOS ---
+    const equipData = kmzProject.items.map(item => {
+      const match = records.find(r => r.id === item.recordId);
+      return {
+        'ETAPA': 'INVENTARIO',
+        'TIPO': item.type,
+        'NOMBRE KMZ': item.name,
+        'ESTADO': item.status === 'INSTALLED' ? 'COMPLETO' : 'INCOMPLETO',
+        'CELDA': item.celda || 'N/A',
+        'METRADO/COORD KMZ': `${item.coordinates.lat}, ${item.coordinates.lng}`,
+        'REPORTE REAL (CODIGO)': match ? match.code : 'PENDIENTE',
+        'POTENCIA LEIDA': match ? match.power : 'N/A',
+        'FECHA REPORTE': match ? match.extractedAt : 'N/A',
+        'TECNICO': match ? (match.userId || 'Sistema') : 'N/A'
+      };
     });
 
-    // 2. Add Tendidos
-    kmzProject.tendidos.forEach(t => {
-      const hasReports = tendidoReports.some(r => r.tendidoId === t.id);
-      rows.push([
-        t.type,
-        t.name,
-        hasReports ? 'COMPLETO' : 'INCOMPLETO',
-        t.celda || 'N/A',
-        `${Math.round(t.totalDistance)}m`,
-        kmzProject.uploadedAt
-      ]);
+    // --- SHEET 2: TENDIDOS ---
+    const tendidoData = kmzProject.tendidos.map(t => {
+      const reports = tendidoReports.filter(r => r.tendidoId === t.id);
+      const isComplete = reports.length > 0;
+      const totalReal = reports.reduce((acc, r) => acc + Math.abs(r.endMeter - r.startMeter), 0);
+      const diff = isComplete ? totalReal - t.totalDistance : 0;
+      
+      // Aggregate hardware from all reports of this tendido
+      const hw = reports.reduce((acc, r) => {
+        const h = r.hardware;
+        return {
+          cintaBandi: acc.cintaBandi + (h.cintaBandi || 0),
+          hevillas: acc.hevillas + (h.hevillas || 0),
+          etiquetas: acc.etiquetas + (h.etiquetas || 0),
+          alambre: acc.alambre + (h.alambre || 0),
+          mensajero: acc.mensajero + (h.mensajero || 0),
+          cruceta: acc.cruceta + (h.cruceta || 0),
+          brazoCruceta: acc.brazoCruceta + (h.brazoCruceta || 0),
+          grillete: acc.grillete + (h.grillete || 0),
+          chapas: acc.chapas + (h.chapas || 0),
+          clevi: acc.clevi + (h.clevi || 0),
+          preformado: acc.preformado + (h.preformado || 0),
+          brazo060: acc.brazo060 + (h.brazo060 || 0),
+          brazo1m: acc.brazo1m + (h.brazo1m || 0),
+          otros: acc.otros + (h.otros ? (acc.otros ? '; ' : '') + h.otros : '')
+        };
+      }, {
+        cintaBandi: 0, hevillas: 0, etiquetas: 0, alambre: 0, mensajero: 0, 
+        cruceta: 0, brazoCruceta: 0, grillete: 0, chapas: 0, clevi: 0, 
+        preformado: 0, brazo060: 0, brazo1m: 0, otros: ''
+      });
+
+      return {
+        'ETAPA': 'TENDIDO',
+        'TIPO': t.type,
+        'NOMBRE TENDIDO': t.name,
+        'CELDA': t.celda || 'N/A',
+        'ESTADO': isComplete ? 'COMPLETO' : 'INCOMPLETO',
+        'DIST. LINEAL (M)': Math.round(t.linearDistance),
+        'TOTAL PROYECTADO (M)': Math.round(t.totalDistance),
+        'LONGITUD REAL (M)': isComplete ? Math.round(totalReal) : 0,
+        'DIFERENCIA (M)': isComplete ? Math.round(diff) : 'N/A',
+        'RES. 50M': t.equipmentCount.reserva50,
+        'RES. 60M': t.equipmentCount.reserva60,
+        'CTO/MUFA PASANTE': t.equipmentCount.ctoMufa,
+        'OTRO PASANTE': t.equipmentCount.pasantes,
+        'CINTA BAND-IT': hw.cintaBandi,
+        'HEVILLAS': hw.hevillas,
+        'ETIQUETAS': hw.etiquetas,
+        'ALAMBRE HEBILLA': hw.alambre,
+        'CRUZ MENSAJERO': hw.mensajero,
+        'CRUCETA': hw.cruceta,
+        'BRAZO CRUCETA': hw.brazoCruceta,
+        'GRILLETE': hw.grillete,
+        'CHAPAS 1-2': hw.chapas,
+        'CLEVIS': hw.clevi,
+        'PREFORMADO': hw.preformado,
+        'BRAZO 0.60': hw.brazo060,
+        'BRAZO 1.0M': hw.brazo1m,
+        'OTROS': hw.otros,
+        'FECHA REPORTE': reports.length > 0 ? reports[0].timestamp : 'N/A',
+        'TECNICO': reports.length > 0 ? (reports[0].technician || 'Tecnico') : 'N/A'
+      };
     });
+
+    // Create Workbook
+    const wb = XLSX.utils.book_new();
     
-    // Properly escape and quote CSV fields using semicolon (;) for Excel in Spanish locales
-    const formatCSVRow = (row: string[]) => {
-      return row.map(field => {
-        const stringField = String(field || '').replace(/"/g, '""');
-        return `"${stringField}"`;
-      }).join(";");
-    };
+    // Create Sheets
+    const wsEquip = XLSX.utils.json_to_sheet(equipData);
+    const wsTendido = XLSX.utils.json_to_sheet(tendidoData);
 
-    // Add BOM and "sep=;" for maximum Excel compatibility
-    const csvContent = "\uFEFF" + "sep=;\n" + [headers, ...rows].map(formatCSVRow).join("\n");
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.setAttribute("href", url);
-    link.setAttribute("download", `inventario_${kmzProject.name.replace(/\s+/g, '_')}_${new Date().toISOString().split('T')[0]}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    // Add Sheets to Workbook
+    XLSX.utils.book_append_sheet(wb, wsEquip, "Equipos");
+    XLSX.utils.book_append_sheet(wb, wsTendido, "Tendidos");
+
+    // Write File
+    const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+    const blob = new Blob([wbout], { type: 'application/octet-stream' });
+    
+    saveAs(blob, `Reporte_Inventario_${kmzProject.name.replace(/\s+/g, '_')}_${new Date().toISOString().split('T')[0]}.xlsx`);
   };
 
   const parseCoordinates = (coordStr: string) => {
@@ -1461,11 +1807,14 @@ export default function App() {
         <name>${record.code}</name>
         <styleUrl>#style-${record.type}</styleUrl>
         <description><![CDATA[
-          <p><b>Type:</b> ${record.type}</p>
-          <p><b>Power:</b> ${record.power}</p>
-          <p><b>Timestamp:</b> ${record.timestamp}</p>
-          <p><b>Coordinates:</b> ${record.coordinates}</p>
-          <p><b>Extracted At:</b> ${record.extractedAt}</p>
+          <div style="font-family: Arial, sans-serif; padding: 10px; width: 300px;">
+            <h3 style="color: #1a73e8; margin-bottom: 5px;">Equipo: ${record.type}</h3>
+            <p><strong>Código:</strong> ${record.code}</p>
+            <p><strong>Potencia:</strong> <span style="color: ${record.power.startsWith('-') && parseFloat(record.power) < -25 ? '#d93025' : '#188038'}">${record.power}</span></p>
+            <p><strong>Fecha/Hora:</strong> ${record.timestamp}</p>
+            <p><strong>ID Técnico:</strong> ${record.userId || 'N/A'}</p>
+            ${record.imageUrl ? `<div style="margin-top:10px;"><img src="${record.imageUrl}" width="280" style="border-radius:8px;"/></div>` : '<p style="color:#666; font-style:italic;">Imagen alojada en App</p>'}
+          </div>
         ]]></description>
         <Point>
           <coordinates>${coords.lon},${coords.lat},0</coordinates>
@@ -1568,6 +1917,31 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#E4E3E0] text-[#141414] font-sans selection:bg-[#141414] selection:text-[#E4E3E0]">
       {/* Header */}
+      {/* Quota Exceeded Banner */}
+      <AnimatePresence>
+        {quotaExceeded && (
+          <motion.div 
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="bg-red-600 text-white overflow-hidden"
+          >
+            <div className="max-w-7xl mx-auto px-6 py-2 flex items-center justify-between gap-4 text-xs font-bold">
+              <div className="flex items-center gap-2">
+                <AlertTriangle size={14} />
+                <span>Límite de Firebase excedido (Cuota de lectura diaria). Los datos podrían no aparecer hasta mañana.</span>
+              </div>
+              <button 
+                onClick={() => window.location.reload()}
+                className="bg-white/20 hover:bg-white/30 px-2 py-1 rounded transition-colors"
+              >
+                Reintentar
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       <header className="border-b border-[#141414] bg-[#E4E3E0] sticky top-0 z-40 relative">
         <div className="max-w-7xl mx-auto px-6 py-4 flex flex-col lg:flex-row justify-between items-center gap-6">
           <div className="flex flex-col sm:flex-row items-start sm:items-center gap-6 w-full lg:w-auto">
@@ -1594,46 +1968,83 @@ export default function App() {
                   }}
                   className="bg-transparent border-none text-xs font-bold outline-none cursor-pointer p-0 appearance-none min-w-[120px]"
                 >
-                  {projects.length === 0 && <option value="">Sin Proyectos</option>}
+                  {projects.length === 0 && !kmzProject && <option value="">Sin Proyectos</option>}
+                  {kmzProject && !projects.find(p => p.id === kmzProject.id) && (
+                    <option value={kmzProject.id}>{kmzProject.name} (Local - Subir para sincronizar)</option>
+                  )}
                   {projects.map(p => (
                     <option key={p.id} value={p.id}>{p.name}</option>
                   ))}
                 </select>
               </div>
+              
               {isAdmin && (
-                <div className="flex items-center gap-1">
+                <div className="flex items-center gap-1.5 ml-1 pl-3 border-l border-[#141414]/10">
                   <button 
                     onClick={() => {
                       const currentProject = projects.find(p => p.id === currentProjectId);
                       if (currentProject) {
                         const newName = prompt("Nuevo nombre del proyecto:", currentProject.name);
                         if (newName && newName.trim()) {
-                          setDoc(doc(db, 'projects', currentProject.id), { ...currentProject, name: newName.trim() }, { merge: true });
+                          setDoc(doc(db, 'projects', currentProject.id), { ...currentProject, name: newName.trim() }, { merge: true })
+                            .catch(err => {
+                              console.error("Error renaming project:", err);
+                              alert("Error al renombrar: " + (err.message || "Permiso denegado"));
+                            });
                         }
                       } else if (kmzProject && kmzProject.id === currentProjectId) {
                         const newName = prompt("Nuevo nombre del proyecto KMZ:", kmzProject.name);
                         if (newName && newName.trim()) {
                           setKmzProject({ ...kmzProject, name: newName.trim() });
                         }
-                      } else if (kmzProject) {
-                        // If we have a KMZ project but no firestore project selected, maybe they want to rename the KMZ
-                        const newName = prompt("Nuevo nombre del proyecto KMZ:", kmzProject.name);
-                        if (newName && newName.trim()) {
-                          setKmzProject({ ...kmzProject, name: newName.trim() });
+                      }
+                    }}
+                    className="p-1.5 hover:bg-[#141414] hover:text-[#E4E3E0] rounded-md transition-all text-[#141414]/60"
+                    title="Renombrar Proyecto"
+                  >
+                    <Edit3 size={14} />
+                  </button>
+                  <button 
+                    onClick={async () => {
+                      const currentProject = projects.find(p => p.id === currentProjectId);
+                      if (!currentProject) return;
+                      
+                      if (confirm(`¿Estás seguro de que deseas eliminar el proyecto "${currentProject.name}"? Esta acción no se puede deshacer.`)) {
+                        try {
+                          await deleteDoc(doc(db, 'projects', currentProject.id));
+                          await deleteDoc(doc(db, 'kmz_projects', currentProject.id));
+                          await deleteDoc(doc(db, 'project_indexes', currentProject.id));
+                          
+                          // Clean up localStorage
+                          localStorage.removeItem(`kmzProject_${currentProject.id}`);
+                          localStorage.removeItem(`tendidoReports_${currentProject.id}`);
+                          localStorage.removeItem(`lastSync_${currentProject.id}`);
+                          
+                          setCurrentProjectId(null);
+                          localStorage.removeItem('currentProjectId');
+                          
+                          const remaining = projects.filter(p => p.id !== currentProject.id);
+                          if (remaining.length > 0) {
+                            setCurrentProjectId(remaining[0].id);
+                            localStorage.setItem('currentProjectId', remaining[0].id);
+                          }
+                        } catch (err: any) {
+                          console.error("Error deleting project:", err);
+                          alert("No se pudo eliminar el proyecto: " + (err.message || "Permiso denegado"));
                         }
                       }
                     }}
-                    className="p-1.5 hover:bg-[#141414] hover:text-[#E4E3E0] rounded transition-all"
-                    title="Renombrar Proyecto"
+                    className="p-1.5 hover:bg-red-500 hover:text-white rounded-md transition-all text-red-500"
+                    title="Eliminar Proyecto"
                   >
-                    <Edit3 size={16} />
+                    <Trash2 size={14} />
                   </button>
                   <button 
                     onClick={() => setIsCreatingProject(true)}
-                    className="p-1.5 hover:bg-[#141414] hover:text-[#E4E3E0] rounded transition-all"
+                    className="p-1.5 hover:bg-blue-600 hover:text-white rounded-md transition-all text-blue-600"
                     title="Nuevo Proyecto"
                   >
-                    <Plus size={16} />
+                    <Plus size={14} />
                   </button>
                 </div>
               )}
@@ -1676,20 +2087,6 @@ export default function App() {
                   <span className="sm:hidden">Sincro</span>
                 </button>
               )}
-              <button 
-                onClick={exportToCSV}
-                className="bg-green-600 text-white px-3 sm:px-4 py-2 text-[10px] font-bold uppercase tracking-widest hover:bg-green-700 transition-all flex items-center gap-2"
-              >
-                <Download size={14} />
-                CSV
-              </button>
-              <button 
-                onClick={exportToKML}
-                className="border border-[#141414] px-3 sm:px-4 py-2 text-[10px] font-bold uppercase tracking-widest hover:bg-[#141414] hover:text-[#E4E3E0] transition-all flex items-center gap-2"
-              >
-                <Download size={14} />
-                KML
-              </button>
 
               <div className="hidden sm:block h-8 w-px bg-[#141414]/10 mx-1" />
 
@@ -1898,6 +2295,21 @@ export default function App() {
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between border-b border-[#141414] pb-2 gap-4">
             <h2 className="font-serif italic text-lg">Registros Extraídos</h2>
             <div className="flex flex-wrap items-center gap-3 sm:gap-4">
+              <button 
+                onClick={exportToKML}
+                disabled={records.length === 0}
+                className={`
+                  flex items-center gap-2 px-4 py-1.5 border border-[#141414] rounded text-[10px] font-bold uppercase tracking-widest transition-all shadow-sm active:scale-95
+                  ${records.length === 0 
+                    ? 'opacity-30 cursor-not-allowed grayscale' 
+                    : 'hover:bg-[#141414] hover:text-white border-opacity-100'}
+                `}
+                title={records.length === 0 ? "No hay datos para exportar" : "Exportar puntos KML"}
+              >
+                <Map size={14} />
+                KML
+              </button>
+              
               {newlyAddedIds.size > 0 && (
                 <button 
                   onClick={clearNewHighlights}
@@ -1939,171 +2351,196 @@ export default function App() {
               </p>
             </div>
           ) : (
-            <div className="overflow-x-auto bg-white rounded-lg border border-[#141414] border-opacity-10">
-              <table className="w-full border-collapse">
-                <thead>
-                  <tr className="text-left border-b border-[#141414] border-opacity-10">
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Vista Previa</th>
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Tipo</th>
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">
-                      <button 
-                        onClick={() => setSortOrder(sortOrder === 'SERIAL_ASC' ? 'SERIAL_DESC' : 'SERIAL_ASC')}
-                        className="flex items-center gap-1 hover:text-[#141414] transition-colors"
-                      >
-                        Código Serial
-                        <ArrowUpDown size={14} strokeWidth={3} className={sortOrder === 'SERIAL_ASC' || sortOrder === 'SERIAL_DESC' ? 'opacity-100 text-blue-600' : 'opacity-30'} />
-                      </button>
-                    </th>
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">
-                      <button 
-                        onClick={() => setSortOrder(sortOrder === 'POWER_ASC' ? 'POWER_DESC' : 'POWER_ASC')}
-                        className="flex items-center gap-1 hover:text-[#141414] transition-colors"
-                      >
-                        Potencia
-                        <ArrowUpDown size={14} strokeWidth={3} className={sortOrder === 'POWER_ASC' || sortOrder === 'POWER_DESC' ? 'opacity-100 text-blue-600' : 'opacity-30'} />
-                      </button>
-                    </th>
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Coordenadas</th>
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Fecha Foto</th>
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Método</th>
-                    <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Acciones</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sortedRecords.map((record) => (
-                    <motion.tr 
-                      layout
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      key={record.id}
-                      className={`group border-b border-[#141414] border-opacity-5 transition-all cursor-default ${
-                        newlyAddedIds.has(record.id) 
-                          ? 'bg-amber-50 hover:bg-[#141414] hover:text-[#E4E3E0]' 
-                          : 'hover:bg-[#141414] hover:text-[#E4E3E0]'
-                      }`}
-                    >
-                      <td className="p-4">
-                        <div 
-                          className="w-12 h-12 bg-gray-200 rounded overflow-hidden cursor-pointer"
-                          onClick={() => setSelectedImage(record.imageUrl)}
+            <>
+              <div className="overflow-x-auto bg-white rounded-lg border border-[#141414] border-opacity-10">
+                <table className="w-full border-collapse">
+                  <thead>
+                    <tr className="text-left border-b border-[#141414] border-opacity-10">
+                      <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Vista Previa</th>
+                      <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Tipo</th>
+                      <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">
+                        <button 
+                          onClick={() => setSortOrder(sortOrder === 'SERIAL_ASC' ? 'SERIAL_DESC' : 'SERIAL_ASC')}
+                          className="flex items-center gap-1 hover:text-[#141414] transition-colors"
                         >
-                          <img 
-                            src={record.imageUrl} 
-                            alt="Equipment" 
-                            className="w-full h-full object-cover"
-                            referrerPolicy="no-referrer"
-                          />
-                        </div>
-                      </td>
-                      <td className="p-4">
-                        <div className="flex items-center gap-2">
-                          {record.type === 'CTO' ? (
-                            <Box size={14} className="opacity-50" />
-                          ) : record.type === 'MUFA' ? (
-                            <Layers size={14} className="opacity-50" />
-                          ) : (
-                            <RotateCcw size={14} className="opacity-50" />
-                          )}
-                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
-                            record.type === 'CTO' 
-                              ? 'border-blue-500 text-blue-500 bg-blue-50' 
-                              : record.type === 'MUFA'
-                              ? 'border-purple-500 text-purple-500 bg-purple-50'
-                              : 'border-orange-500 text-orange-500 bg-orange-50'
-                          }`}>
-                            {record.type}
-                          </span>
-                        </div>
-                      </td>
-                      <td 
-                        className="p-4 font-mono text-sm tracking-tight cursor-text"
-                        onDoubleClick={() => startEditing(record)}
-                        title="Doble clic para editar"
+                          Código Serial
+                          <ArrowUpDown size={14} strokeWidth={3} className={sortOrder === 'SERIAL_ASC' || sortOrder === 'SERIAL_DESC' ? 'opacity-100 text-blue-600' : 'opacity-30'} />
+                        </button>
+                      </th>
+                      <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">
+                        <button 
+                          onClick={() => setSortOrder(sortOrder === 'POWER_ASC' ? 'POWER_DESC' : 'POWER_ASC')}
+                          className="flex items-center gap-1 hover:text-[#141414] transition-colors"
+                        >
+                          Potencia
+                          <ArrowUpDown size={14} strokeWidth={3} className={sortOrder === 'POWER_ASC' || sortOrder === 'POWER_DESC' ? 'opacity-100 text-blue-600' : 'opacity-30'} />
+                        </button>
+                      </th>
+                      <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Coordenadas</th>
+                      <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Fecha Foto</th>
+                      <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Método</th>
+                      <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Acciones</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {paginatedRecords.map((record) => (
+                      <motion.tr 
+                        layout
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        key={record.id}
+                        className={`group border-b border-[#141414] border-opacity-5 transition-all cursor-default ${
+                          newlyAddedIds.has(record.id) 
+                            ? 'bg-amber-50 hover:bg-[#141414] hover:text-[#E4E3E0]' 
+                            : 'hover:bg-[#141414] hover:text-[#E4E3E0]'
+                        }`}
                       >
-                        <div className="flex items-center gap-2">
-                          <Hash size={12} className="opacity-30 group-hover:opacity-100" />
-                          {editingId === record.id ? (
-                            <input 
-                              type="text"
-                              value={editValues.code}
-                              onChange={(e) => setEditValues(prev => ({ ...prev, code: e.target.value }))}
-                              onKeyDown={(e) => handleKeyDown(e, record.id)}
-                              onBlur={() => saveEdit(record.id)}
-                              className="bg-white border border-[#141414] px-2 py-1 text-xs outline-none w-full text-[#141414]"
-                              autoFocus
-                            />
-                          ) : (
-                            record.code
-                          )}
-                        </div>
-                      </td>
-                      <td className="p-4 font-mono text-sm tracking-tight">
-                        <div className="flex items-center gap-2">
-                          <Zap size={12} className="opacity-30 group-hover:opacity-100" />
-                          {record.power}
-                        </div>
-                      </td>
-                      <td 
-                        className="p-4 font-mono text-sm tracking-tight cursor-text"
-                        onDoubleClick={() => startEditing(record)}
-                        title="Doble clic para editar"
-                      >
-                        <div className="flex items-center gap-2">
-                          <MapPin size={12} className="opacity-30 group-hover:opacity-100" />
-                          {editingId === record.id ? (
-                            <input 
-                              type="text"
-                              value={editValues.coordinates}
-                              onChange={(e) => setEditValues(prev => ({ ...prev, coordinates: e.target.value }))}
-                              onKeyDown={(e) => handleKeyDown(e, record.id)}
-                              onBlur={() => saveEdit(record.id)}
-                              className="bg-white border border-[#141414] px-2 py-1 text-xs outline-none w-full text-[#141414]"
-                            />
-                          ) : (
-                            record.coordinates
-                          )}
-                        </div>
-                      </td>
-                      <td className="p-4 font-mono text-sm tracking-tight">
-                        <div className="flex items-center gap-2">
-                          <Calendar size={12} className="opacity-30 group-hover:opacity-100" />
-                          {record.timestamp}
-                        </div>
-                      </td>
-                      <td className="p-4">
-                        <div className="flex flex-col gap-1">
-                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border w-fit ${
-                            record.method === 'LOCAL' 
-                              ? 'border-green-500 text-green-500 bg-green-50' 
-                              : record.method === 'HYBRID'
-                              ? 'border-blue-500 text-blue-500 bg-blue-50'
-                              : 'border-purple-500 text-purple-500 bg-purple-50'
-                          }`}>
-                            {record.method || 'GEMINI'}
-                          </span>
-                          {record.method !== 'LOCAL' && record.aiModel && (
-                            <span className="text-[8px] uppercase tracking-tighter opacity-40">
-                              {record.aiModel}
-                            </span>
-                          )}
-                        </div>
-                      </td>
-                      <td className="p-4">
-                        <div className="flex items-center gap-2">
-                          <button 
-                            onClick={() => deleteRecord(record.id)}
-                            className="p-2 hover:bg-red-500 hover:text-white rounded transition-colors text-red-600"
-                            title="Eliminar"
+                        <td className="p-4">
+                          <div 
+                            className="w-12 h-12 bg-slate-200 rounded overflow-hidden cursor-pointer flex items-center justify-center relative group/img"
+                            onClick={() => record.imageUrl ? setSelectedImage(record.imageUrl) : fetchRecordImage(record.id)}
                           >
-                            <Trash2 size={16} />
-                          </button>
-                        </div>
-                      </td>
-                    </motion.tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                            {record.imageUrl ? (
+                              <img 
+                                src={record.imageUrl} 
+                                alt="Equipment" 
+                                className="w-full h-full object-cover transition-transform group-hover/img:scale-110"
+                                referrerPolicy="no-referrer"
+                              />
+                            ) : (
+                              <div className="flex flex-col items-center justify-center w-full h-full bg-slate-100 text-slate-400 hover:text-blue-600 transition-colors">
+                                {loadingImages.has(record.id) ? (
+                                  <Loader2 size={16} className="animate-spin" />
+                                ) : (
+                                  <ImageIcon size={16} />
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                        <td className="p-4">
+                          <div className="flex items-center gap-2">
+                            {record.type === 'CTO' ? (
+                              <Box size={14} className="opacity-50" />
+                            ) : record.type === 'MUFA' ? (
+                              <Layers size={14} className="opacity-50" />
+                            ) : (
+                              <RotateCcw size={14} className="opacity-50" />
+                            )}
+                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
+                              record.type === 'CTO' 
+                                ? 'border-blue-500 text-blue-500 bg-blue-50' 
+                                : record.type === 'MUFA'
+                                ? 'border-purple-500 text-purple-500 bg-purple-50'
+                                : 'border-orange-500 text-orange-500 bg-orange-50'
+                            }`}>
+                              {record.type}
+                            </span>
+                          </div>
+                        </td>
+                        <td 
+                          className="p-4 font-mono text-sm tracking-tight cursor-text"
+                          onDoubleClick={() => startEditing(record)}
+                          title="Doble clic para editar"
+                        >
+                          <div className="flex items-center gap-2">
+                            <Hash size={12} className="opacity-30 group-hover:opacity-100" />
+                            {editingId === record.id ? (
+                              <input 
+                                type="text"
+                                value={editValues.code}
+                                onChange={(e) => setEditValues(prev => ({ ...prev, code: e.target.value }))}
+                                onKeyDown={(e) => handleKeyDown(e, record.id)}
+                                onBlur={() => saveEdit(record.id)}
+                                className="bg-white border border-[#141414] px-2 py-1 text-xs outline-none w-full text-[#141414]"
+                                autoFocus
+                              />
+                            ) : (
+                              record.code
+                            )}
+                          </div>
+                        </td>
+                        <td className="p-4 font-mono text-sm tracking-tight">
+                          <div className="flex items-center gap-2">
+                            <Zap size={12} className="opacity-30 group-hover:opacity-100" />
+                            {record.power}
+                          </div>
+                        </td>
+                        <td 
+                          className="p-4 font-mono text-sm tracking-tight cursor-text"
+                          onDoubleClick={() => startEditing(record)}
+                          title="Doble clic para editar"
+                        >
+                          <div className="flex items-center gap-2">
+                            <MapPin size={12} className="opacity-30 group-hover:opacity-100" />
+                            {editingId === record.id ? (
+                              <input 
+                                type="text"
+                                value={editValues.coordinates}
+                                onChange={(e) => setEditValues(prev => ({ ...prev, coordinates: e.target.value }))}
+                                onKeyDown={(e) => handleKeyDown(e, record.id)}
+                                onBlur={() => saveEdit(record.id)}
+                                className="bg-white border border-[#141414] px-2 py-1 text-xs outline-none w-full text-[#141414]"
+                              />
+                            ) : (
+                              record.coordinates
+                            )}
+                          </div>
+                        </td>
+                        <td className="p-4 font-mono text-sm tracking-tight">
+                          <div className="flex items-center gap-2">
+                            <Calendar size={12} className="opacity-30 group-hover:opacity-100" />
+                            {record.timestamp}
+                          </div>
+                        </td>
+                        <td className="p-4">
+                          <div className="flex flex-col gap-1">
+                            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border w-fit ${
+                              record.method === 'LOCAL' 
+                                ? 'border-green-500 text-green-500 bg-green-50' 
+                                : record.method === 'HYBRID'
+                                ? 'border-blue-500 text-blue-500 bg-blue-50'
+                                : 'border-purple-500 text-purple-500 bg-purple-50'
+                            }`}>
+                              {record.method || 'GEMINI'}
+                            </span>
+                            {record.method !== 'LOCAL' && record.aiModel && (
+                              <span className="text-[8px] uppercase tracking-tighter opacity-40">
+                                {record.aiModel}
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="p-4">
+                          <div className="flex items-center gap-2">
+                            <button 
+                              onClick={() => deleteRecord(record.id)}
+                              className="p-2 hover:bg-red-500 hover:text-white rounded transition-colors text-red-600"
+                              title="Eliminar"
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          </div>
+                        </td>
+                      </motion.tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Pagination Button */}
+              {sortedRecords.length > displayLimit && (
+                <div className="mt-8 flex justify-center">
+                  <button 
+                    onClick={() => setDisplayLimit(prev => prev + 20)}
+                    className="flex items-center gap-3 px-8 py-3 bg-[#141414] text-[#E4E3E0] text-xs font-bold uppercase tracking-[0.2em] hover:bg-[#141414]/90 transition-all rounded shadow-lg hover:shadow-xl active:scale-95"
+                  >
+                    <Plus size={16} strokeWidth={3} />
+                    Cargar más registros ({sortedRecords.length - displayLimit} restantes)
+                  </button>
+                </div>
+              )}
+            </>
           )}
         </div>
       </div>
@@ -2137,6 +2574,48 @@ export default function App() {
             </div>
           ) : (
             <div className="space-y-8">
+              {/* Project Title & Progress */}
+              <div className="bg-white p-6 rounded-2xl border border-[#141414]/5 shadow-sm space-y-4">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <div>
+                    <h2 className="text-xl font-black tracking-tighter uppercase">{kmzProject.name}</h2>
+                    <p className="text-xs opacity-50 font-medium">Proyecto cargado el {new Date(kmzProject.uploadedAt).toLocaleDateString()}</p>
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <button 
+                      onClick={() => setRecords([])}
+                      className="p-2 hover:bg-red-50 text-red-600 rounded-lg transition-colors flex items-center gap-2 text-xs font-bold uppercase tracking-widest"
+                      title="Reiniciar matcheo local"
+                    >
+                      <RotateCcw size={14} />
+                      Reset
+                    </button>
+                    <button 
+                      onClick={exportToCSV}
+                      className="bg-[#18A058] text-white px-6 py-2 rounded text-[10px] font-bold uppercase tracking-widest hover:bg-[#18A058]/90 transition-all shadow-md active:scale-95 flex items-center gap-2"
+                    >
+                      <FileSpreadsheet size={16} />
+                      CSV
+                    </button>
+                  </div>
+                </div>
+
+                {/* Progress Bar */}
+                <div className="space-y-2">
+                  <div className="flex justify-between text-[10px] font-black uppercase tracking-widest">
+                    <span>Avance General de Inventario</span>
+                    <span className="text-blue-600">{Math.round((kmzProject.items.filter(i => i.status === 'INSTALLED').length / kmzProject.items.length) * 100)}%</span>
+                  </div>
+                  <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
+                    <motion.div 
+                      initial={{ width: 0 }}
+                      animate={{ width: `${(kmzProject.items.filter(i => i.status === 'INSTALLED').length / kmzProject.items.length) * 100}%` }}
+                      className="h-full bg-blue-600 rounded-full shadow-[0_0_10px_rgba(37,99,235,0.3)]"
+                    />
+                  </div>
+                </div>
+              </div>
+
               {/* Stats Grid */}
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <div className="bg-white p-6 rounded-xl border border-[#141414]/5 shadow-sm flex flex-col justify-between">
@@ -2369,7 +2848,9 @@ export default function App() {
                               item.name.toLowerCase().includes(searchLower) ||
                               (item.celda && item.celda.toLowerCase().includes(searchLower));
                             
-                            const matchesType = inventoryTypeFilter === 'ALL' || item.type === inventoryTypeFilter;
+                            const matchesType = inventoryTypeFilter === 'ALL' 
+                              ? (item.type !== 'RESERVA') // Excluir Reservas de "Todos Tipos" por defecto
+                              : item.type === inventoryTypeFilter;
                             const matchesStatus = inventoryStatusFilter === 'ALL' || item.status === inventoryStatusFilter;
                             
                             // Strict Celda filtering: trim and handle empty strings
@@ -2382,6 +2863,7 @@ export default function App() {
                             } else if (filterCelda === 'NONE') {
                               matchesCelda = itemCelda === '';
                             } else {
+                              // Coincidencia exacta: el item debe tener celda y debe ser igual al filtro
                               matchesCelda = itemCelda !== '' && itemCelda === filterCelda;
                             }
                             
@@ -2432,8 +2914,70 @@ export default function App() {
                     </table>
                   </div>
                 ) : (
-                  <div className="overflow-x-auto">
-                    <table className="w-full border-collapse">
+                  <div className="flex flex-col gap-4">
+                    {/* Subtle Totals Bar */}
+                    {(() => {
+                      const filteredTendidos = kmzProject.tendidos.filter(t => {
+                        const searchLower = inventorySearchQuery.toLowerCase().trim();
+                        const matchesSearch = !searchLower || 
+                          t.name.toLowerCase().includes(searchLower) ||
+                          (t.celda && t.celda.toLowerCase().includes(searchLower));
+
+                        const matchesType = tendidoTypeFilter === 'ALL' || t.type === tendidoTypeFilter;
+                        
+                        const tCelda = (t.celda || '').trim();
+                        const fCelda = (tendidoCeldaFilter || 'ALL').trim();
+                        
+                        let matchesCelda = false;
+                        if (fCelda === 'ALL') {
+                          matchesCelda = true;
+                        } else if (fCelda === 'NONE') {
+                          matchesCelda = tCelda === '';
+                        } else {
+                          matchesCelda = tCelda !== '' && tCelda === fCelda;
+                        }
+                        
+                        const hasReports = tendidoReports.some(r => r.tendidoId === t.id);
+                        const matchesStatus = tendidoStatusFilter === 'ALL' || 
+                          (tendidoStatusFilter === 'COMPLETED' && hasReports) ||
+                          (tendidoStatusFilter === 'PENDING' && !hasReports);
+                          
+                        return matchesSearch && matchesType && matchesCelda && matchesStatus;
+                      });
+
+                      const totalLinear = filteredTendidos.reduce((acc, t) => acc + t.linearDistance, 0);
+                      const totalProjected = filteredTendidos.reduce((acc, t) => acc + t.totalDistance, 0);
+                      const totalReal = filteredTendidos.reduce((acc, t) => {
+                        const reports = tendidoReports.filter(r => r.tendidoId === t.id);
+                        return acc + reports.reduce((rAcc, r) => rAcc + Math.abs(r.endMeter - r.startMeter), 0);
+                      }, 0);
+
+                      if (filteredTendidos.length === 0) return null;
+
+                      return (
+                        <div className="flex items-center gap-6 px-4 py-1.5 bg-blue-50/80 border border-blue-100 rounded-lg text-[10px]">
+                          <div className="flex items-center gap-2">
+                            <span className="font-serif italic text-blue-800/60 uppercase tracking-widest">Total Lineal:</span>
+                            <span className="font-mono font-bold text-blue-900">{Math.round(totalLinear).toLocaleString()}m</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="font-serif italic text-blue-800/60 uppercase tracking-widest">Total Proyectado:</span>
+                            <span className="font-mono font-bold text-blue-600">{Math.round(totalProjected).toLocaleString()}m</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="font-serif italic text-blue-800/60 uppercase tracking-widest">Longitud Real:</span>
+                            <span className="font-mono font-bold text-green-700">{Math.round(totalReal).toLocaleString()}m</span>
+                          </div>
+                          <div className="ml-auto flex items-center gap-2">
+                            <span className="font-serif italic text-blue-800/40 uppercase tracking-widest">Items:</span>
+                            <span className="font-bold text-blue-900/40">{filteredTendidos.length}</span>
+                          </div>
+                        </div>
+                      );
+                    })()}
+
+                    <div className="overflow-x-auto">
+                      <table className="w-full border-collapse">
                       <thead>
                         <tr className="bg-[#F8F9FA] text-left">
                           <th className="p-4 font-serif italic text-[11px] uppercase tracking-widest opacity-50">Estado</th>
@@ -2448,8 +2992,8 @@ export default function App() {
                         </tr>
                       </thead>
                       <tbody>
-                        {kmzProject.tendidos
-                          .filter(t => {
+                        {(() => {
+                          const filteredTendidos = kmzProject.tendidos.filter(t => {
                             const searchLower = inventorySearchQuery.toLowerCase().trim();
                             const matchesSearch = !searchLower || 
                               t.name.toLowerCase().includes(searchLower) ||
@@ -2466,6 +3010,7 @@ export default function App() {
                             } else if (fCelda === 'NONE') {
                               matchesCelda = tCelda === '';
                             } else {
+                              // Coincidencia exacta para tendidos: debe tener celda y ser igual al filtro
                               matchesCelda = tCelda !== '' && tCelda === fCelda;
                             }
                             
@@ -2475,135 +3020,159 @@ export default function App() {
                               (tendidoStatusFilter === 'PENDING' && !hasReports);
                               
                             return matchesSearch && matchesType && matchesCelda && matchesStatus;
-                          })
-                          .map((tendido) => (
-                          <tr key={tendido.id} className="border-b border-[#141414]/5 hover:bg-[#F8F9FA] transition-colors">
-                            <td className="p-4">
-                              {(() => {
-                                const hasReports = tendidoReports.some(r => r.tendidoId === tendido.id);
-                                return hasReports ? (
-                                  <div className="flex items-center gap-2 text-green-600">
-                                    <div className="w-4 h-4 rounded-full bg-green-500 flex items-center justify-center">
-                                      <CheckCircle size={12} className="text-white" />
-                                    </div>
-                                    <span className="text-[10px] font-bold uppercase tracking-widest">Completo</span>
-                                  </div>
-                                ) : (
-                                  <div className="flex items-center gap-2 text-gray-400">
-                                    <div className="w-4 h-4 rounded-full bg-gray-300" />
-                                    <span className="text-[10px] font-bold uppercase tracking-widest">Incompleto</span>
-                                  </div>
-                                );
-                              })()}
-                            </td>
-                            <td 
-                              className="p-4 font-mono text-sm font-bold cursor-text"
-                              onDoubleClick={() => startEditingTendido(tendido)}
-                            >
-                              {editingTendidoId === tendido.id ? (
-                                <input 
-                                  type="text"
-                                  value={editTendidoName}
-                                  onChange={(e) => setEditTendidoName(e.target.value)}
-                                  onKeyDown={handleTendidoKeyDown}
-                                  onBlur={saveTendidoEdit}
-                                  className="bg-white border border-blue-600 px-2 py-1 text-xs outline-none w-full"
-                                  autoFocus
-                                />
-                              ) : (
-                                tendido.name
-                              )}
-                            </td>
-                            <td className="p-4">
-                              <span className={`text-[9px] font-bold px-2 py-0.5 rounded border ${
-                                tendido.type === '96H' ? 'border-red-500 text-red-500 bg-red-50' :
-                                tendido.type === '48H' ? 'border-orange-500 text-orange-500 bg-orange-50' :
-                                tendido.type === '24H' ? 'border-yellow-500 text-yellow-500 bg-yellow-50' :
-                                'border-gray-500 text-gray-500 bg-gray-50'
-                              }`}>
-                                {tendido.type}
-                              </span>
-                            </td>
-                            <td className="p-4 text-xs">
-                              {tendido.celda ? (
-                                <span className="bg-gray-100 px-2 py-1 rounded border border-gray-200 font-bold text-gray-700">
-                                  {tendido.celda}
-                                </span>
-                              ) : (
-                                <span className="opacity-30">N/A</span>
-                              )}
-                            </td>
-                            <td className="p-4 font-mono text-sm">{Math.round(tendido.linearDistance)}m</td>
-                            <td className="p-4">
-                              <div className="flex flex-col gap-1">
-                                {(tendido.type === '96H' || tendido.type === '48H') && (
-                                  <span className="text-[9px] font-bold text-blue-600">+40m (Extremos)</span>
-                                )}
-                                {tendido.equipmentCount.ctoMufa > 0 && (tendido.type !== '96H' && tendido.type !== '48H') && (
-                                  <span className="text-[9px] opacity-60">+{tendido.equipmentCount.ctoMufa * 20}m ({tendido.equipmentCount.ctoMufa} CTO/MUFA)</span>
-                                )}
-                                {tendido.equipmentCount.reserva50 > 0 && (
-                                  <span className="text-[9px] opacity-60">+{tendido.equipmentCount.reserva50 * 50}m ({tendido.equipmentCount.reserva50} Res. 50m)</span>
-                                )}
-                                {tendido.equipmentCount.reserva60 > 0 && (
-                                  <span className="text-[9px] opacity-60">+{tendido.equipmentCount.reserva60 * 60}m ({tendido.equipmentCount.reserva60} Res. 60m)</span>
-                                )}
-                              </div>
-                            </td>
-                            <td className="p-4 font-mono text-sm font-bold text-blue-600">
-                              {Math.round(tendido.totalDistance)}m
-                            </td>
-                            <td className="p-4">
-                              {(() => {
-                                const reports = tendidoReports.filter(r => r.tendidoId === tendido.id);
-                                if (reports.length === 0) return <span className="text-[10px] opacity-30">Sin reportes</span>;
-                                
-                                const totalReal = reports.reduce((acc, r) => acc + Math.abs(r.endMeter - r.startMeter), 0);
-                                const diff = Math.abs(totalReal - tendido.totalDistance);
-                                const isWithinLimit = diff <= 50;
-                                
-                                return (
-                                  <div className="flex items-center gap-2">
-                                    <span className={`font-mono text-sm font-bold ${isWithinLimit ? 'text-green-600' : 'text-red-600'}`}>
-                                      {Math.round(totalReal)}m
+                          });
+
+                          const totalLinear = filteredTendidos.reduce((acc, t) => acc + t.linearDistance, 0);
+                          const totalProjected = filteredTendidos.reduce((acc, t) => acc + t.totalDistance, 0);
+                          const totalReal = filteredTendidos.reduce((acc, t) => {
+                            const reports = tendidoReports.filter(r => r.tendidoId === t.id);
+                            return acc + reports.reduce((rAcc, r) => rAcc + Math.abs(r.endMeter - r.startMeter), 0);
+                          }, 0);
+
+                          return (
+                            <>
+                              {filteredTendidos.map((tendido) => (
+                                <tr key={tendido.id} className="border-b border-[#141414]/5 hover:bg-[#F8F9FA] transition-colors">
+                                  <td className="p-4">
+                                    {(() => {
+                                      const hasReports = tendidoReports.some(r => r.tendidoId === tendido.id);
+                                      return hasReports ? (
+                                        <div className="flex items-center gap-2 text-green-600">
+                                          <div className="w-4 h-4 rounded-full bg-green-500 flex items-center justify-center">
+                                            <CheckCircle size={12} className="text-white" />
+                                          </div>
+                                          <span className="text-[10px] font-bold uppercase tracking-widest">Completo</span>
+                                        </div>
+                                      ) : (
+                                        <div className="flex items-center gap-2 text-gray-400">
+                                          <div className="w-4 h-4 rounded-full bg-gray-300" />
+                                          <span className="text-[10px] font-bold uppercase tracking-widest">Incompleto</span>
+                                        </div>
+                                      );
+                                    })()}
+                                  </td>
+                                  <td 
+                                    className="p-4 font-mono text-sm font-bold cursor-text"
+                                    onDoubleClick={() => startEditingTendido(tendido)}
+                                  >
+                                    {editingTendidoId === tendido.id ? (
+                                      <input 
+                                        type="text"
+                                        value={editTendidoName}
+                                        onChange={(e) => setEditTendidoName(e.target.value)}
+                                        onKeyDown={handleTendidoKeyDown}
+                                        onBlur={saveTendidoEdit}
+                                        className="bg-white border border-blue-600 px-2 py-1 text-xs outline-none w-full"
+                                        autoFocus
+                                      />
+                                    ) : (
+                                      tendido.name
+                                    )}
+                                  </td>
+                                  <td className="p-4">
+                                    <span className={`text-[9px] font-bold px-2 py-0.5 rounded border ${
+                                      tendido.type === '96H' ? 'border-red-500 text-red-500 bg-red-50' :
+                                      tendido.type === '48H' ? 'border-orange-500 text-orange-500 bg-orange-50' :
+                                      tendido.type === '24H' ? 'border-yellow-500 text-yellow-500 bg-yellow-50' :
+                                      'border-gray-500 text-gray-500 bg-gray-50'
+                                    }`}>
+                                      {tendido.type}
                                     </span>
-                                    <div className={`w-2 h-2 rounded-full ${isWithinLimit ? 'bg-green-500' : 'bg-red-500'}`} />
-                                  </div>
-                                );
-                              })()}
-                            </td>
-                            <td className="p-4">
-                              <div className="flex items-center gap-2">
-                                <button 
-                                  onClick={() => deleteTendido(tendido.id)}
-                                  className="p-2 hover:bg-red-500 hover:text-white rounded transition-colors text-red-600"
-                                  title="Eliminar tendido"
-                                >
-                                  <Trash2 size={14} />
-                                </button>
-                                {(() => {
-                                  const report = tendidoReports.find(r => r.tendidoId === tendido.id);
-                                  if (report) {
-                                    return (
+                                  </td>
+                                  <td className="p-4 text-xs">
+                                    {tendido.celda ? (
+                                      <span className="bg-gray-100 px-2 py-1 rounded border border-gray-200 font-bold text-gray-700">
+                                        {tendido.celda}
+                                      </span>
+                                    ) : (
+                                      <span className="opacity-30">N/A</span>
+                                    )}
+                                  </td>
+                                  <td className="p-4 font-mono text-sm">{Math.round(tendido.linearDistance)}m</td>
+                                  <td className="p-4">
+                                    <div className="flex flex-col gap-1">
+                                      {tendido.extrasDetails && tendido.extrasDetails.length > 0 ? (
+                                        tendido.extrasDetails.map((detail, idx) => (
+                                          <span key={idx} className={`text-[9px] font-bold ${detail.includes('Extremos') ? 'text-blue-600' : 'opacity-60'}`}>
+                                            {detail}
+                                          </span>
+                                        ))
+                                      ) : (
+                                        <>
+                                          {(tendido.type === '96H' || tendido.type === '48H') && (
+                                            <span className="text-[9px] font-bold text-blue-600">+40m (Extremos)</span>
+                                          )}
+                                          {tendido.equipmentCount.ctoMufa > 0 && (tendido.type !== '96H' && tendido.type !== '48H') && (
+                                            <span className="text-[9px] opacity-60">+{tendido.equipmentCount.ctoMufa * 20}m ({tendido.equipmentCount.ctoMufa} CTO/MUFA)</span>
+                                          )}
+                                          {tendido.equipmentCount.reserva50 > 0 && (
+                                            <span className="text-[9px] opacity-60">+{tendido.equipmentCount.reserva50 * 50}m ({tendido.equipmentCount.reserva50} Res. 50m)</span>
+                                          )}
+                                          {tendido.equipmentCount.reserva60 > 0 && (
+                                            <span className="text-[9px] opacity-60">+{tendido.equipmentCount.reserva60 * 60}m ({tendido.equipmentCount.reserva60} Res. 60m)</span>
+                                          )}
+                                        </>
+                                      )}
+                                    </div>
+                                  </td>
+                                  <td className="p-4 font-mono text-sm font-bold text-blue-600">
+                                    {Math.round(tendido.totalDistance)}m
+                                  </td>
+                                  <td className="p-4">
+                                    {(() => {
+                                      const reports = tendidoReports.filter(r => r.tendidoId === tendido.id);
+                                      if (reports.length === 0) return <span className="text-[10px] opacity-30">Sin reportes</span>;
+                                      
+                                      const totalReal = reports.reduce((acc, r) => acc + Math.abs(r.endMeter - r.startMeter), 0);
+                                      const diffMeters = Math.abs(totalReal - tendido.totalDistance);
+                                      const isWithinLimit = diffMeters <= 20;
+                                      
+                                      return (
+                                        <div className="flex items-center gap-2">
+                                          <span className={`font-mono text-sm font-bold ${isWithinLimit ? 'text-green-600' : 'text-red-600'}`}>
+                                            {Math.round(totalReal)}m
+                                          </span>
+                                          <div className={`w-2 h-2 rounded-full ${isWithinLimit ? 'bg-green-500' : 'bg-red-500'}`} />
+                                        </div>
+                                      );
+                                    })()}
+                                  </td>
+                                  <td className="p-4">
+                                    <div className="flex items-center gap-2">
                                       <button 
-                                        onClick={() => setShowReportSummary(report)}
-                                        className="p-2 hover:bg-blue-500 hover:text-white rounded transition-colors text-blue-600"
-                                        title="Ver reporte de materiales"
+                                        onClick={() => deleteTendido(tendido.id)}
+                                        className="p-2 hover:bg-red-500 hover:text-white rounded transition-colors text-red-600"
+                                        title="Eliminar tendido"
                                       >
-                                        <Eye size={14} />
+                                        <Trash2 size={14} />
                                       </button>
-                                    );
-                                  }
-                                  return null;
-                                })()}
-                              </div>
-                            </td>
-                          </tr>
-                        ))}
+                                      {(() => {
+                                        const report = tendidoReports.find(r => r.tendidoId === tendido.id);
+                                        if (report) {
+                                          return (
+                                            <button 
+                                              onClick={() => setShowReportSummary(report)}
+                                              className="p-2 hover:bg-blue-500 hover:text-white rounded transition-colors text-blue-600"
+                                              title="Ver reporte de materiales"
+                                            >
+                                              <Eye size={14} />
+                                            </button>
+                                          );
+                                        }
+                                        return null;
+                                      })()}
+                                    </div>
+                                  </td>
+                                </tr>
+                              ))}
+                            </>
+                          );
+                        })()}
                       </tbody>
                     </table>
                   </div>
-                )}
+                </div>
+              )}
               </div>
             </div>
           )}
@@ -2889,7 +3458,7 @@ export default function App() {
                       <p className="font-bold uppercase tracking-tight">Entorno Externo Detectado</p>
                       <p className="opacity-80">
                         Estás fuera de AI Studio. Los modelos de Google (Gemini) fallarán con error 403. 
-                        <strong> Debes usar OpenRouter</strong> para extraer datos en Netlify.
+                        <strong> Debes usar OpenRouter</strong> para extraer datos en esta vista previa.
                       </p>
                     </div>
                   </div>
@@ -2934,16 +3503,18 @@ export default function App() {
                           // 1. Migrate from old localStorage
                           await storage.migrateFromLocalStorage();
                           // 2. Sync local records to cloud
-                          const localRecords = await storage.loadRecords();
-                          if (localRecords.length > 0 && currentProjectId && user) {
-                            for (const record of localRecords) {
-                              await setDoc(doc(db, 'records', record.id), {
-                                ...record,
-                                projectId: record.projectId || currentProjectId,
-                                userId: record.userId || user.uid
-                              }, { merge: true });
+                          if (currentProjectId) {
+                            const localRecords = await storage.loadRecords(currentProjectId);
+                            if (localRecords.length > 0 && user) {
+                              for (const record of localRecords) {
+                                await setDoc(doc(db, 'records', record.id), {
+                                  ...record,
+                                  projectId: record.projectId || currentProjectId,
+                                  userId: record.userId || user.uid
+                                }, { merge: true });
+                              }
+                              await storage.saveRecords(currentProjectId, []);
                             }
-                            await storage.saveRecords([]);
                           }
                           
                           // 3. Cloud Recovery: Find records for this user that might be in other projects

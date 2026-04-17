@@ -1,6 +1,6 @@
 export interface EquipmentRecord {
   id: string;
-  imageUrl: string;
+  imageUrl?: string; // Optional now, as it might be loaded lazily
   code: string;
   type: 'CTO' | 'MUFA' | 'RESERVA';
   coordinates: string;
@@ -12,6 +12,21 @@ export interface EquipmentRecord {
   isNew?: boolean;
   userId?: string;
   projectId: string;
+}
+
+export interface ProjectIndex {
+  projectId: string;
+  lastUpdated: string;
+  items: EquipmentRecordSummary[];
+}
+
+export interface EquipmentRecordSummary {
+  id: string;
+  code: string;
+  type: 'CTO' | 'MUFA' | 'RESERVA';
+  coordinates: string;
+  power: string;
+  extractedAt: string;
 }
 
 export interface Project {
@@ -55,11 +70,14 @@ export interface TendidoItem {
     ctoMufa: number;
     reserva50: number;
     reserva60: number;
+    pasantes: number;
   };
+  extrasDetails?: string[];
 }
 
 export interface TendidoReport {
   id: string;
+  projectId: string;
   tendidoId: string;
   startMeter: number;
   endMeter: number;

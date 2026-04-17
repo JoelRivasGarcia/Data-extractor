@@ -5,9 +5,17 @@ interface AuthContextType {
   user: User | null;
   loading: boolean;
   isAdmin: boolean;
+  quotaExceeded: boolean;
+  setQuotaExceeded: (val: boolean) => void;
 }
 
-const AuthContext = createContext<AuthContextType>({ user: null, loading: true, isAdmin: false });
+const AuthContext = createContext<AuthContextType>({ 
+  user: null, 
+  loading: true, 
+  isAdmin: false, 
+  quotaExceeded: false,
+  setQuotaExceeded: () => {}
+});
 
 export const useAuth = () => useContext(AuthContext);
 
@@ -15,6 +23,7 @@ export const FirebaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   const [isAdmin, setIsAdmin] = useState(false);
+  const [quotaExceeded, setQuotaExceeded] = useState(false);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
@@ -45,8 +54,14 @@ export const FirebaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
               setIsAdmin(data?.role === 'admin' || isMainAdmin);
             }
           }
-        } catch (error) {
+        } catch (error: any) {
           console.error("Error fetching user profile:", error);
+          
+          // Detect Quota Exceeded
+          if (error.message?.includes('quota') || error.code === 'resource-exhausted') {
+            setQuotaExceeded(true);
+          }
+
           // Fallback for the main admin if database is unreachable
           if (user.email === 'joelrivasgarciagy@gmail.com') {
             setIsAdmin(true);
@@ -62,7 +77,7 @@ export const FirebaseProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   }, []);
 
   return (
-    <AuthContext.Provider value={{ user, loading, isAdmin }}>
+    <AuthContext.Provider value={{ user, loading, isAdmin, quotaExceeded, setQuotaExceeded }}>
       {children}
     </AuthContext.Provider>
   );

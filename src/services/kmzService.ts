@@ -105,7 +105,8 @@ export async function parseKmz(file: File): Promise<{ name: string; items: Inven
         totalDistance: linearDist,
         points: linePoints,
         celda: tendidoCelda,
-        equipmentCount: { ctoMufa: 0, reserva50: 0, reserva60: 0 }
+        equipmentCount: { ctoMufa: 0, reserva50: 0, reserva60: 0, pasantes: 0 },
+        extrasDetails: []
       });
     }
   });
@@ -124,30 +125,55 @@ export async function parseKmz(file: File): Promise<{ name: string; items: Inven
 
   // Calculate extra distances for tendidos
   tendidos.forEach(tendido => {
-    // New logic for 96H and 48H: +20m at each end (total +40m)
-    if (tendido.type === '96H' || tendido.type === '48H') {
-      tendido.totalDistance += 40; // 20m per end
-    }
+    const startPoint = tendido.points[0];
+    const endPoint = tendido.points[tendido.points.length - 1];
+    
+    tendido.extrasDetails = [];
+    tendido.totalDistance = tendido.linearDistance; // Reset to linear before adding extras
+    
+    // 1. Extremos: 15m cada uno (Total +30m)
+    tendido.totalDistance += 30;
+    tendido.extrasDetails.push("+30m (Extremos)");
 
     items.forEach(item => {
+      const distToStart = calculateDistance(item.coordinates.lat, item.coordinates.lng, startPoint.lat, startPoint.lng);
+      const distToEnd = calculateDistance(item.coordinates.lat, item.coordinates.lng, endPoint.lat, endPoint.lng);
+      
+      // Threshold of 10 meters to match the detection radius and avoid double counting at ends
+      const isAtEnd = distToStart < 10 || distToEnd < 10;
+
       if (isPointNearLine(item.coordinates, tendido.points, 10)) { // 10m threshold
-        if (tendido.type === '96H' || tendido.type === '48H') {
-          // Only Reservas count as extra for 96H/48H
-          if (item.type === 'RESERVA') {
-            const meters = parseInt(item.name) || 50;
-            if (meters === 60) {
-              tendido.equipmentCount.reserva60++;
-              tendido.totalDistance += 60;
-            } else {
-              tendido.equipmentCount.reserva50++;
-              tendido.totalDistance += 50;
+        if (item.type === 'RESERVA') {
+          // Extract meters from name (e.g., "Reserva 10m" -> 10)
+          const meters = parseInt(item.name.replace(/[^0-9]/g, '')) || 50;
+          tendido.totalDistance += meters;
+          tendido.extrasDetails.push(`+${meters}m (${item.name})`);
+          
+          if (meters === 60) tendido.equipmentCount.reserva60++;
+          else tendido.equipmentCount.reserva50++;
+        } else if (!isAtEnd) {
+          // Pasante logic refined by cable type
+          let shouldAddExtra = false;
+          let label = "";
+
+          if (item.type === 'MUFA') {
+            // 96H and 48H consider MUFAs, 24H does NOT (only CTOs)
+            if (tendido.type === '96H' || tendido.type === '48H' || tendido.type === 'OTRO') {
+              shouldAddExtra = true;
+              label = "+20m (MUFA pasante)";
+            }
+          } else if (item.type === 'CTO') {
+            // 24H considers CTOs, 96H and 48H do NOT
+            if (tendido.type === '24H' || tendido.type === 'OTRO') {
+              shouldAddExtra = true;
+              label = "+20m (CTO pasante)";
             }
           }
-        } else {
-          // For other types (like 24H), keep the +20m per CTO/MUFA logic if applicable
-          if (item.type === 'CTO' || item.type === 'MUFA') {
-            tendido.equipmentCount.ctoMufa++;
+
+          if (shouldAddExtra) {
             tendido.totalDistance += 20;
+            tendido.equipmentCount.pasantes++;
+            tendido.extrasDetails.push(label);
           }
         }
       }
@@ -158,6 +184,23 @@ export async function parseKmz(file: File): Promise<{ name: string; items: Inven
 }
 
 function isPointNearLine(point: { lat: number; lng: number }, line: { lat: number; lng: number }[], threshold: number): boolean {
+  // 1. Fast Bounding Box Check: If the point is far from the entire line's BB, skip expensive math
+  let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+  for (const p of line) {
+    if (p.lat < minLat) minLat = p.lat;
+    if (p.lat > maxLat) maxLat = p.lat;
+    if (p.lng < minLng) minLng = p.lng;
+    if (p.lng > maxLng) maxLng = p.lng;
+  }
+  
+  // Convert threshold (meters) to approximate degrees (rough estimation is enough for BB)
+  const thresholdDeg = threshold / 111320; 
+  if (point.lat < minLat - thresholdDeg || point.lat > maxLat + thresholdDeg ||
+      point.lng < minLng - thresholdDeg || point.lng > maxLng + thresholdDeg) {
+    return false;
+  }
+
+  // 2. Precise Segment Check
   for (let i = 0; i < line.length - 1; i++) {
     const dist = distToSegment(point, line[i], line[i + 1]);
     if (dist <= threshold) return true;
@@ -166,19 +209,20 @@ function isPointNearLine(point: { lat: number; lng: number }, line: { lat: numbe
 }
 
 function distToSegment(p: { lat: number; lng: number }, v: { lat: number; lng: number }, w: { lat: number; lng: number }): number {
-  const l2 = Math.pow(calculateDistance(v.lat, v.lng, w.lat, w.lng), 2);
+  // Use squared coordinate distance for the ratio 't' to avoid mixing units
+  const l2 = Math.pow(w.lat - v.lat, 2) + Math.pow(w.lng - v.lng, 2);
   if (l2 === 0) return calculateDistance(p.lat, p.lng, v.lat, v.lng);
   
-  // This is a simplification for small distances on earth surface
-  // For better accuracy we'd need a more complex formula, but for 10m threshold it's usually fine
-  const t = ((p.lat - v.lat) * (w.lat - v.lat) + (p.lng - v.lng) * (w.lng - v.lng)) / l2;
-  const tClamped = Math.max(0, Math.min(1, t));
+  // Calculate projection ratio t
+  let t = ((p.lat - v.lat) * (w.lat - v.lat) + (p.lng - v.lng) * (w.lng - v.lng)) / l2;
+  t = Math.max(0, Math.min(1, t));
   
   const projection = {
-    lat: v.lat + tClamped * (w.lat - v.lat),
-    lng: v.lng + tClamped * (w.lng - v.lng)
+    lat: v.lat + t * (w.lat - v.lat),
+    lng: v.lng + t * (w.lng - v.lng)
   };
   
+  // Final distance in meters using Haversine
   return calculateDistance(p.lat, p.lng, projection.lat, projection.lng);
 }
 

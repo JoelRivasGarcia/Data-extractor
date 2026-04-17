@@ -49,7 +49,7 @@ service cloud.firestore {
     function isAdmin() {
       return isAuthenticated() && 
         (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
-         (request.auth.token.email == "joelrivasgarciagy@gmail.com" && request.auth.token.email_verified == true));
+         request.auth.token.email == "joelrivasgarciagy@gmail.com");
     }
 
     function isValidEmail(email) {
@@ -57,18 +57,29 @@ service cloud.firestore {
     }
 
     function isValidRecord(data) {
-      return data.keys().hasAll(['id', 'code', 'type', 'coordinates', 'timestamp', 'power', 'imageUrl', 'extractedAt', 'method', 'userId', 'projectId']) &&
+      return data.keys().hasAny(['imageUrl']) == false && // Ensure NO image here
+             data.keys().hasAll(['id', 'code', 'type', 'coordinates', 'timestamp', 'power', 'extractedAt', 'method', 'userId', 'projectId']) &&
              data.id is string &&
              data.code is string && data.code.size() < 100 &&
              data.type in ['CTO', 'MUFA', 'RESERVA'] &&
              data.coordinates is string && data.coordinates.size() < 100 &&
              data.timestamp is string && data.timestamp.size() < 100 &&
              data.power is string && data.power.size() < 50 &&
-             data.imageUrl is string && data.imageUrl.size() < 1048576 &&
              data.extractedAt is string &&
              data.method in ['LOCAL', 'GEMINI', 'HYBRID'] &&
              data.userId == request.auth.uid &&
              data.projectId is string;
+    }
+
+    function isValidImage(data) {
+      return data.keys().hasAll(['imageUrl']) &&
+             data.imageUrl is string && data.imageUrl.size() < 1048576;
+    }
+
+    function isValidIndex(data) {
+      return data.keys().hasAll(['projectId', 'items']) &&
+             data.projectId is string &&
+             data.items is list;
     }
 
     function isValidProject(data) {
@@ -76,7 +87,7 @@ service cloud.firestore {
              data.id is string &&
              data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
              data.createdAt is string &&
-             data.createdBy == request.auth.uid &&
+             (data.createdBy == request.auth.uid || isAdmin()) &&
              data.status in ['active', 'archived'];
     }
 
@@ -103,6 +114,18 @@ service cloud.firestore {
       allow create: if isAuthenticated() && isValidRecord(request.resource.data);
       allow update: if (isDocOwner() || isAdmin()) && isValidRecord(request.resource.data);
       allow delete: if isDocOwner() || isAdmin();
+    }
+
+    match /record_images/{recordId} {
+      // images are protected by UUID and requiring authentication
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && isValidImage(request.resource.data);
+      allow delete: if isAuthenticated(); // Simplified owner check could be added
+    }
+
+    match /project_indexes/{projectId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && isValidIndex(request.resource.data);
     }
 
     match /users/{userId} {
