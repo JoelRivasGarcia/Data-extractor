@@ -39,6 +39,10 @@ export async function extractEquipmentData(
                 1. The large serial code/identifier printed on the equipment (e.g., WN-20A-2369450). 
                    IMPORTANT: CTO codes ALWAYS start with the prefix "WN-".
                 2. The equipment type: "CTO", "MUFA", or "RESERVA".
+                   VISUAL CUES:
+                   - CTO: Rectangular boxes with multiple guest connector ports (customer drop cables). Look for "WN-" codes.
+                   - MUFA: Large black splice closures, usually cylindrical (bottle-shaped) or large rectangles without customer ports. 
+                   - RESERVA: Coil of fiber optic cable, usually in a loop on the pole, sometimes on a cross-arm or bracket.
                 3. The GPS coordinates (latitude and longitude) shown in the overlay text. 
                    IMPORTANT: These photos are from PERU. Coordinates should be in the range of Lat: -18 to 0 and Lon: -82 to -68.
                 4. The date and time shown in the overlay text.

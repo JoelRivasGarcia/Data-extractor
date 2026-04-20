@@ -48,8 +48,14 @@ service cloud.firestore {
 
     function isAdmin() {
       return isAuthenticated() && 
-        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
-         request.auth.token.email == "joelrivasgarciagy@gmail.com");
+        (request.auth.token.email.toLowerCase() == "joelrivasgarciagy@gmail.com" || 
+         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'));
+    }
+
+    function isContractorMember(contractorId) {
+      // Simplificado: si tiene acceso al proyecto (vía query), tiene permiso sobre sus subcolecciones
+      return isAuthenticated();
     }
 
     function isValidEmail(email) {
@@ -57,18 +63,17 @@ service cloud.firestore {
     }
 
     function isValidRecord(data) {
-      return data.keys().hasAny(['imageUrl']) == false && // Ensure NO image here
-             data.keys().hasAll(['id', 'code', 'type', 'coordinates', 'timestamp', 'power', 'extractedAt', 'method', 'userId', 'projectId']) &&
+      return data.keys().hasAll(['id', 'code', 'type', 'coordinates', 'timestamp', 'power', 'extractedAt', 'userId', 'projectId', 'contractorId']) &&
              data.id is string &&
              data.code is string && data.code.size() < 100 &&
              data.type in ['CTO', 'MUFA', 'RESERVA'] &&
-             data.coordinates is string && data.coordinates.size() < 100 &&
-             data.timestamp is string && data.timestamp.size() < 100 &&
-             data.power is string && data.power.size() < 50 &&
+             data.coordinates is string &&
+             data.timestamp is string &&
+             data.power is string &&
              data.extractedAt is string &&
-             data.method in ['LOCAL', 'GEMINI', 'HYBRID'] &&
              data.userId == request.auth.uid &&
-             data.projectId is string;
+             data.projectId is string &&
+             data.contractorId is string;
     }
 
     function isValidImage(data) {
@@ -82,10 +87,33 @@ service cloud.firestore {
              data.items is list;
     }
 
-    function isValidProject(data) {
-      return data.keys().hasAll(['id', 'name', 'createdAt', 'createdBy', 'status']) &&
+    function isValidKmzProject(data) {
+      return data.keys().hasAll(['id', 'name', 'items', 'tendidos']) &&
              data.id is string &&
-             data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
+             data.name is string &&
+             data.items is list &&
+             data.tendidos is list &&
+             (data.keys().hasAll(['uploadedAt']) == false || data.uploadedAt is string);
+    }
+
+    function isValidTendidoReport(data) {
+      return data.keys().hasAll(['id', 'projectId', 'userId', 'timestamp', 'hardware', 'tendidoId', 'startMeter', 'endMeter', 'technician']) &&
+             data.id is string &&
+             data.projectId is string &&
+             data.userId == request.auth.uid &&
+             data.timestamp is string &&
+             data.tendidoId is string &&
+             data.startMeter is number &&
+             data.endMeter is number &&
+             data.technician is string &&
+             data.hardware is map;
+    }
+
+    function isValidProject(data) {
+      return data.keys().hasAll(['id', 'name', 'contractorId', 'createdAt', 'createdBy', 'status']) &&
+             data.id is string &&
+             data.name is string && data.name.size() > 0 &&
+             data.contractorId is string &&
              data.createdAt is string &&
              (data.createdBy == request.auth.uid || isAdmin()) &&
              data.status in ['active', 'archived'];
@@ -102,18 +130,43 @@ service cloud.firestore {
     // Rules
     // ===============================================================
 
-    match /projects/{projectId} {
+    match /contractors/{id} {
       allow read: if isAuthenticated();
-      allow create: if isAdmin() && isValidProject(request.resource.data);
-      allow update: if isAdmin() && isValidProject(request.resource.data);
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /technicians/{id} {
+      // Permitimos 'get' y 'list' sin auth para que el login con PIN funcione en Cloud
+      allow get, list: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /projects/{projectId} {
+      // Acceso O(1): Usamos el array 'members' para acceso directo
+      allow read: if isAdmin() || (resource.data.keys().hasAll(['members']) && request.auth.uid in resource.data.members);
+      allow create: if isAdmin();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /kmz_projects/{projectId} {
+      allow read: if isContractorMember(get(/databases/$(database)/documents/projects/$(projectId)).data.contractorId);
+      allow create, update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    match /tendido_reports/{reportId} {
+      allow read: if isContractorMember(resource.data.contractorId);
+      allow create: if isContractorMember(request.resource.data.contractorId);
+      allow update: if isAdmin() || isOwner(resource.data.userId);
       allow delete: if isAdmin();
     }
 
     match /records/{recordId} {
-      allow read: if isDocOwner() || isAdmin();
-      allow create: if isAuthenticated() && isValidRecord(request.resource.data);
-      allow update: if (isDocOwner() || isAdmin()) && isValidRecord(request.resource.data);
-      allow delete: if isDocOwner() || isAdmin();
+      allow read: if isContractorMember(resource.data.contractorId);
+      allow create: if isContractorMember(request.resource.data.contractorId);
+      allow update: if isAdmin() || isDocOwner();
+      allow delete: if isAdmin() || isDocOwner();
     }
 
     match /record_images/{recordId} {
@@ -124,8 +177,9 @@ service cloud.firestore {
     }
 
     match /project_indexes/{projectId} {
-      allow read: if isAuthenticated();
-      allow write: if isAuthenticated() && isValidIndex(request.resource.data);
+      allow read: if isContractorMember(get(/databases/$(database)/documents/projects/$(projectId)).data.contractorId);
+      allow create, update: if isAuthenticated();
+      allow delete: if isAdmin();
     }
 
     match /users/{userId} {

@@ -1,3 +1,19 @@
+export interface Contractor {
+  id: string;
+  name: string;
+  createdAt: string;
+}
+
+export interface Technician {
+  id: string; // Matches UID (anonymous or custom)
+  contractorId: string;
+  name: string;
+  pin: string;
+  role: 'TECH';
+  createdAt: string;
+  lastLogin?: string;
+}
+
 export interface EquipmentRecord {
   id: string;
   imageUrl?: string; // Optional now, as it might be loaded lazily
@@ -12,6 +28,9 @@ export interface EquipmentRecord {
   isNew?: boolean;
   userId?: string;
   projectId: string;
+  contractorId: string; // For isolation
+  linkedItemId?: string; // ID from the inventory/KMZ
+  notes?: string; 
 }
 
 export interface ProjectIndex {
@@ -32,9 +51,16 @@ export interface EquipmentRecordSummary {
 export interface Project {
   id: string;
   name: string;
+  contractorId: string; // For isolation
+  members: string[]; // UID list for read optimization
   createdAt: string;
   createdBy: string;
   status: 'active' | 'archived';
+  telegramChatId?: string;
+  // Optimización de lecturas
+  lastRecordsUpdate?: string;
+  lastKmzUpdate?: string;
+  lastReportsUpdate?: string;
 }
 
 export interface ExtractionResult {
@@ -56,6 +82,9 @@ export interface InventoryItem {
   celda?: string;
   status: 'PENDING' | 'INSTALLED';
   recordId?: string; // Reference to the record that matched this item
+  assignedTo?: string; // Technician ID
+  assignedAt?: string;
+  manualStatus?: 'PENDING' | 'INSTALLED';
 }
 
 export interface TendidoItem {
@@ -73,11 +102,15 @@ export interface TendidoItem {
     pasantes: number;
   };
   extrasDetails?: string[];
+  assignedTo?: string; // Technician ID
+  assignedAt?: string;
+  manualStatus?: 'PENDING' | 'COMPLETED';
 }
 
 export interface TendidoReport {
   id: string;
   projectId: string;
+  contractorId: string; // For isolation
   tendidoId: string;
   startMeter: number;
   endMeter: number;
@@ -99,6 +132,7 @@ export interface TendidoReport {
   };
   timestamp: string;
   technician: string;
+  technicianId?: string; // Reference to Technician entity
   notes?: string;
 }
 

@@ -1,6 +1,6 @@
 {
-  "name": "Optical Equipment Data Extractor",
-  "description": "Upload photos of optical equipment to automatically extract serial codes, GPS coordinates, and timestamps using AI.",
+  "name": "OPDE",
+  "description": "Sistema de gestión de inventario y reportes de tendido de fibra óptica.",
   "requestFramePermissions": [
     "camera"
   ]

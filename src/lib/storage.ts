@@ -4,6 +4,10 @@ import { EquipmentRecord } from '../types';
 const STORAGE_KEY_PREFIX = 'records_cache_';
 const LAST_SYNC_PREFIX = 'last_sync_';
 const PENDING_KEY = 'pending_uploads_v2';
+const CONTRACTORS_KEY = 'local_contractors';
+const TECHNICIANS_KEY = 'local_technicians_';
+const PROJECTS_KEY = 'local_projects_';
+const REPORTS_KEY = 'local_reports_';
 
 export interface PendingUpload {
   id: string;
@@ -28,6 +32,14 @@ export const storage = {
 
   async getLastSync(projectId: string): Promise<string | null> {
     return await get<string>(`${LAST_SYNC_PREFIX}${projectId}`) || null;
+  },
+
+  async saveBlob(id: string, blob: Blob): Promise<void> {
+    await set(`blob_${id}`, blob);
+  },
+
+  async getBlob(id: string): Promise<Blob | null> {
+    return await get<Blob>(`blob_${id}`) || null;
   },
 
   async clearAll(): Promise<void> {
@@ -61,6 +73,43 @@ export const storage = {
 
   async clearPendingUploads(): Promise<void> {
     await del(PENDING_KEY);
+  },
+
+  // Offline / Dev Mode Storage
+  async saveLocalContractors(contractors: any[]): Promise<void> {
+    await set(CONTRACTORS_KEY, contractors);
+  },
+
+  async getLocalContractors(): Promise<any[]> {
+    return await get(CONTRACTORS_KEY) || [];
+  },
+
+  async saveLocalTechnicians(contractorId: string, technicians: any[]): Promise<void> {
+    await set(`${TECHNICIANS_KEY}${contractorId}`, technicians);
+  },
+
+  async getLocalTechnicians(contractorId: string): Promise<any[]> {
+    return await get(`${TECHNICIANS_KEY}${contractorId}`) || [];
+  },
+
+  async saveLocalProjects(contractorId: string, projects: any[]): Promise<void> {
+    await set(`${PROJECTS_KEY}${contractorId}`, projects);
+  },
+
+  async getLocalProjects(contractorId: string): Promise<any[]> {
+    return await get(`${PROJECTS_KEY}${contractorId}`) || [];
+  },
+
+  async saveLocalReports(projectId: string, reports: any[]): Promise<void> {
+    await set(`${REPORTS_KEY}${projectId}`, reports);
+  },
+
+  async getLocalReports(projectId: string): Promise<any[]> {
+    return await get(`${REPORTS_KEY}${projectId}`) || [];
+  },
+
+  async deleteLocalReports(projectId: string): Promise<void> {
+    await del(`${REPORTS_KEY}${projectId}`);
   },
 
   async saveGeminiCache(hash: string, result: any): Promise<void> {

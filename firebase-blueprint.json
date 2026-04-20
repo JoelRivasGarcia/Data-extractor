@@ -51,9 +51,80 @@
         "power": { "type": "string" },
         "extractedAt": { "type": "string" }
       }
+    },
+    "KmzProject": {
+      "title": "KMZ Project",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "items": { "type": "array" },
+        "tendidos": { "type": "array" }
+      }
+    },
+    "TendidoReport": {
+      "title": "Tendido Report",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "projectId": { "type": "string" },
+        "contractorId": { "type": "string" },
+        "userId": { "type": "string" },
+        "technicianId": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "data": { "type": "object" }
+      }
+    },
+    "Contractor": {
+      "title": "Contractor",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "createdAt": { "type": "string" }
+      }
+    },
+    "Technician": {
+      "title": "Technician",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "contractorId": { "type": "string" },
+        "name": { "type": "string" },
+        "pin": { "type": "string" },
+        "role": { "type": "string" },
+        "createdAt": { "type": "string" }
+      }
+    },
+    "Project": {
+      "title": "Project",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "contractorId": { "type": "string" },
+        "name": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "createdBy": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "archived"] },
+        "lastRecordsUpdate": { "type": "string", "format": "date-time" },
+        "lastKmzUpdate": { "type": "string", "format": "date-time" },
+        "lastReportsUpdate": { "type": "string", "format": "date-time" }
+      }
     }
   },
   "firestore": {
+    "/contractors/{id}": {
+      "schema": "Contractor",
+      "description": "Company/Division isolation entity."
+    },
+    "/technicians/{id}": {
+      "schema": "Technician",
+      "description": "Technician identity and access credentials."
+    },
+    "/projects/{projectId}": {
+      "schema": "Project",
+      "description": "Main project metadata and sync timestamps."
+    },
     "/records/{id}": {
       "schema": "EquipmentRecord",
       "description": "Individual metadata for equipment."
@@ -65,6 +136,14 @@
     "/project_indexes/{projectId}": {
       "schema": "ProjectIndex",
       "description": "The 'Bucket' document for project-wide inventory list."
+    },
+    "/kmz_projects/{projectId}": {
+      "schema": "KmzProject",
+      "description": "The project technical structure and KMZ items."
+    },
+    "/tendido_reports/{id}": {
+      "schema": "TendidoReport",
+      "description": "Reports for fiber stretching."
     }
   }
 }

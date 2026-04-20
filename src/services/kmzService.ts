@@ -39,8 +39,10 @@ export async function parseKmz(file: File): Promise<{ name: string; items: Inven
     const fullPath = getFolderPath(pm);
     const fullPathUpper = fullPath.toUpperCase();
     
-    // Skip if not in a relevant folder (optional, but helps if KMZ has unrelated data)
-    // For now we assume everything in the KMZ might be relevant if it matches our criteria
+    // Ignore anything inside a folder named "EXISTENTE" (case insensitive)
+    if (fullPathUpper.includes('EXISTENTE')) {
+      return;
+    }
     
     const pointCoords = getCoords(pm);
     const linePoints = getLinePoints(pm);
