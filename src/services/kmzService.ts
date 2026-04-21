@@ -141,10 +141,10 @@ export async function parseKmz(file: File): Promise<{ name: string; items: Inven
       const distToStart = calculateDistance(item.coordinates.lat, item.coordinates.lng, startPoint.lat, startPoint.lng);
       const distToEnd = calculateDistance(item.coordinates.lat, item.coordinates.lng, endPoint.lat, endPoint.lng);
       
-      // Threshold of 10 meters to match the detection radius and avoid double counting at ends
-      const isAtEnd = distToStart < 10 || distToEnd < 10;
+      // Threshold of 5 meters to match the detection radius and avoid double counting at ends
+      const isAtEnd = distToStart < 5 || distToEnd < 5;
 
-      if (isPointNearLine(item.coordinates, tendido.points, 10)) { // 10m threshold
+      if (isPointNearLine(item.coordinates, tendido.points, 5)) { // 5m threshold
         if (item.type === 'RESERVA') {
           // Extract meters from name (e.g., "Reserva 10m" -> 10)
           const meters = parseInt(item.name.replace(/[^0-9]/g, '')) || 50;

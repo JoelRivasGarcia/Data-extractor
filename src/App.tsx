@@ -1402,56 +1402,72 @@ export default function App() {
 
     setIsParsingKmz(true);
     try {
-      const { name, items, tendidos } = await parseKmz(file);
+      const { name: kmzInternalName, items, tendidos } = await parseKmz(file);
       
-      // Check if project with same name exists to reuse ID and keep photos linked
-      const existingProject = projects.find(p => p.name.toUpperCase() === name.toUpperCase());
-      const newProjectId = existingProject ? existingProject.id : crypto.randomUUID();
+      // 1. Prioritize Current Project ID if exists
+      // 2. Fallback to same-name project search
+      // 3. Last fallback: New UUID
+      const currentProj = currentProjectId ? projects.find(p => p.id === currentProjectId) : null;
+      const existingProjByName = !currentProjectId ? projects.find(p => p.name.toUpperCase() === kmzInternalName.toUpperCase()) : null;
+      
+      const targetProjectId = currentProjectId || (existingProjByName ? existingProjByName.id : crypto.randomUUID());
+      const targetProjectName = currentProj ? currentProj.name : (existingProjByName ? existingProjByName.name : kmzInternalName);
       
       // Prevent useEffect from overwriting the fresh upload with empty localStorage
       isKmzInitialLoad.current = false;
-      lastProjectId.current = newProjectId;
+      lastProjectId.current = targetProjectId;
+
+      const newUploadedAt = new Date().toISOString();
 
       setKmzProject({
-        id: newProjectId,
-        name,
+        id: targetProjectId,
+        name: targetProjectName,
         items,
         tendidos,
-        uploadedAt: new Date().toISOString()
+        uploadedAt: newUploadedAt
       });
       
-      setCurrentProjectId(newProjectId);
-      localStorage.setItem('currentProjectId', newProjectId);
-      localStorage.setItem(`kmzProject_${newProjectId}`, JSON.stringify({
-        id: newProjectId,
-        name,
+      setCurrentProjectId(targetProjectId);
+      localStorage.setItem('currentProjectId', targetProjectId);
+      localStorage.setItem(`kmzProject_${targetProjectId}`, JSON.stringify({
+        id: targetProjectId,
+        name: targetProjectName,
         items,
         tendidos,
-        uploadedAt: new Date().toISOString()
+        uploadedAt: newUploadedAt
       }));
 
       // Save project metadata and KMZ structure to Firestore
       if (user) {
-        const newProject: Project = {
-          id: newProjectId,
-          name,
-          contractorId: currentContractorId || '',
-          members: [user.uid],
-          createdAt: new Date().toISOString(),
-          createdBy: user.uid,
-          status: 'active',
-          lastKmzUpdate: new Date().toISOString()
-        };
+        // If it's a new project shell, we create it; otherwise update lastKmzUpdate
+        const isNew = !projects.some(p => p.id === targetProjectId);
         
-        // Use a batch to ensure both are saved or none
         const batch = writeBatch(db);
-        batch.set(doc(db, 'projects', newProjectId), newProject);
-        batch.set(doc(db, 'kmz_projects', newProjectId), {
-          id: newProjectId,
-          name,
+        
+        if (isNew) {
+          const newProject: Project = {
+            id: targetProjectId,
+            name: targetProjectName,
+            contractorId: currentContractorId || '',
+            members: [user.uid],
+            createdAt: newUploadedAt,
+            createdBy: user.uid,
+            status: 'active',
+            lastKmzUpdate: newUploadedAt
+          };
+          batch.set(doc(db, 'projects', targetProjectId), newProject);
+        } else {
+          batch.update(doc(db, 'projects', targetProjectId), {
+            lastKmzUpdate: newUploadedAt
+          });
+        }
+
+        batch.set(doc(db, 'kmz_projects', targetProjectId), {
+          id: targetProjectId,
+          name: targetProjectName,
           items,
           tendidos,
-          uploadedAt: newProject.lastKmzUpdate
+          uploadedAt: newUploadedAt
         });
         
         await batch.commit();
