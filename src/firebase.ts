@@ -1,6 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged, User } from 'firebase/auth';
-import { getFirestore, doc, setDoc, getDoc, updateDoc, collection, query, where, onSnapshot, getDocFromServer, limit, getDocs, writeBatch, arrayUnion, arrayRemove, deleteDoc } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, getDoc, updateDoc, collection, query, where, onSnapshot, getDocFromServer, limit, getDocs, writeBatch, arrayUnion, arrayRemove, deleteDoc, deleteField } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
 // Initialize Firebase
@@ -19,7 +19,8 @@ async function testConnection() {
     }
   }
 }
-testConnection();
+// Removed module-level testConnection for better startup performance
+// testConnection();
 
-export { signInWithPopup, signOut, onAuthStateChanged, collection, query, where, onSnapshot, doc, setDoc, getDoc, updateDoc, limit, getDocs, writeBatch, arrayUnion, arrayRemove, deleteDoc };
+export { signInWithPopup, signOut, onAuthStateChanged, collection, query, where, onSnapshot, doc, setDoc, getDoc, updateDoc, limit, getDocs, writeBatch, arrayUnion, arrayRemove, deleteDoc, deleteField };
 export type { User };

@@ -187,5 +187,10 @@ service cloud.firestore {
       allow create: if isAuthenticated() && isValidUser(request.resource.data) && (request.resource.data.role == 'technician' || isAdmin());
       allow update: if (isOwner(userId) || isAdmin()) && isValidUser(request.resource.data) && (request.resource.data.role == resource.data.role || isAdmin());
     }
+
+    match /system_settings/{settingId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
   }
 }

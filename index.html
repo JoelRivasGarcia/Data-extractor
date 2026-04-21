@@ -7,9 +7,18 @@
     <link rel="manifest" href="/manifest.json" />
     <meta name="theme-color" content="#141414" />
     <script>
+      // Force unregister existing service workers to clear broken cache
       if ('serviceWorker' in navigator) {
-        window.addEventListener('load', () => {
-          navigator.serviceWorker.register('/sw.js');
+        navigator.serviceWorker.getRegistrations().then(function(registrations) {
+          for(let registration of registrations) {
+            registration.unregister();
+          }
+        });
+      }
+      // Clear Cache API if exists
+      if ('caches' in window) {
+        caches.keys().then(function(names) {
+          for (let name of names) caches.delete(name);
         });
       }
     </script>

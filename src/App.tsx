@@ -62,21 +62,33 @@ import { extractEquipmentData } from './services/geminiService';
 import { extractWithOpenRouter, fetchOpenRouterModels } from './services/openRouterService';
 import { storage, PendingUpload } from './lib/storage';
 import { compressImage, getImageHash } from './lib/utils';
-import { auth, googleProvider, signInWithPopup, signOut, db, collection, query, where, onSnapshot, doc, setDoc, getDoc, updateDoc, limit, getDocs, writeBatch, arrayUnion, arrayRemove, deleteDoc } from './firebase';
+import { auth, googleProvider, signInWithPopup, signOut, db, collection, query, where, onSnapshot, doc, setDoc, getDoc, updateDoc, limit, getDocs, writeBatch, arrayUnion, arrayRemove, deleteDoc, deleteField } from './firebase';
 import { useAuth, handleFirestoreError, OperationType } from './FirebaseProvider';
 
 export default function App() {
   const { user, loading: authLoading, isAdmin: isGoogleAdmin, quotaExceeded, setQuotaExceeded } = useAuth();
   const isSuperAdmin = user?.email?.toLowerCase() === 'joelrivasgarciagy@gmail.com';
-  const [techSession, setTechSession] = useState<{ contractorId: string; technicianId: string; name: string } | null>(
-    JSON.parse(localStorage.getItem('techSession') || 'null')
-  );
+  const [techSession, setTechSession] = useState<{ contractorId: string; technicianId: string; name: string } | null>(() => {
+    try {
+      const saved = localStorage.getItem('techSession');
+      return saved && saved !== 'undefined' ? JSON.parse(saved) : null;
+    } catch (e) {
+      console.error("Error parsing techSession:", e);
+      return null;
+    }
+  });
   const [techLoginForm, setTechLoginForm] = useState({ contractorId: '', pin: '' });
   const [isLoggingInTech, setIsLoggingInTech] = useState(false);
   
   const isAdmin = isGoogleAdmin || isSuperAdmin;
   const isTechnician = techSession !== null;
-  const [activeContractorId, setActiveContractorId] = useState<string | null>(localStorage.getItem('activeContractorId'));
+  const [activeContractorId, setActiveContractorId] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('activeContractorId');
+    } catch (e) {
+      return null;
+    }
+  });
   const currentContractorId = techSession?.contractorId || activeContractorId;
 
   const [records, setRecords] = useState<EquipmentRecord[]>([]);
@@ -99,7 +111,13 @@ export default function App() {
   const [showDeleteKmzConfirm, setShowDeleteKmzConfirm] = useState(false);
   const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
   const [uploadProgress, setUploadProgress] = useState({ current: 0, total: 0 });
-  const [telegramBotToken, setTelegramBotToken] = useState<string>(localStorage.getItem('telegramBotToken') || '');
+  const [telegramBotToken, setTelegramBotToken] = useState<string>(() => {
+    try {
+      return localStorage.getItem('telegramBotToken') || '';
+    } catch (e) {
+      return '';
+    }
+  });
   const [isSavingBotToken, setIsSavingBotToken] = useState(false);
   const [isSavingChatId, setIsSavingChatId] = useState(false);
   const [uploadSummary, setUploadSummary] = useState<{
@@ -109,10 +127,19 @@ export default function App() {
   } | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsLoaded, setProjectsLoaded] = useState(false);
-  const [currentProjectId, setCurrentProjectId] = useState<string | null>(localStorage.getItem('currentProjectId'));
+  const [currentProjectId, setCurrentProjectId] = useState<string | null>(() => {
+    const saved = localStorage.getItem('currentProjectId');
+    return saved === 'null' || saved === 'undefined' ? null : saved;
+  });
   const [isCreatingProject, setIsCreatingProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
-  const [openRouterKey, setOpenRouterKey] = useState<string>(localStorage.getItem('openRouterKey') || '');
+  const [openRouterKey, setOpenRouterKey] = useState<string>(() => {
+    try {
+      return localStorage.getItem('openRouterKey') || '';
+    } catch (e) {
+      return '';
+    }
+  });
   const [showSettings, setShowSettings] = useState(false);
   const [isTestingKey, setIsTestingKey] = useState(false);
   const [keyStatus, setKeyStatus] = useState<'idle' | 'valid' | 'invalid'>('idle');
@@ -148,10 +175,14 @@ export default function App() {
   const [editTendidoName, setEditTendidoName] = useState('');
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [editingProjectName, setEditingProjectName] = useState('');
+  const [editingProjectTelegramId, setEditingProjectTelegramId] = useState('');
+  const [newProjectTelegramId, setNewProjectTelegramId] = useState('');
   const [editingContractorId, setEditingContractorId] = useState<string | null>(null);
   const [editingContractorName, setEditingContractorName] = useState('');
   const [isParsingKmz, setIsParsingKmz] = useState(false);
   const [newReport, setNewReport] = useState<Partial<TendidoReport>>({
+    startMeter: 0,
+    endMeter: 0,
     hardware: { 
       cintaBandi: 0, hevillas: 0, etiquetas: 0, alambre: 0, mensajero: 0, 
       cruceta: 0, brazoCruceta: 0, grillete: 0, chapas: 0, clevi: 0, 
@@ -169,7 +200,14 @@ export default function App() {
   const [isSubmittingEquipment, setIsSubmittingEquipment] = useState(false);
   const [showMetersSummary, setShowMetersSummary] = useState(false);
   const [showHardwareSummary, setShowHardwareSummary] = useState(false);
-  const [storageMode, setStorageMode] = useState<'cloud' | 'local'>(localStorage.getItem('storageMode') as any || 'cloud');
+  const [storageMode, setStorageMode] = useState<'cloud' | 'local'>(() => {
+    try {
+      const mode = localStorage.getItem('storageMode');
+      return (mode === 'cloud' || mode === 'local') ? mode : 'cloud';
+    } catch (e) {
+      return 'cloud';
+    }
+  });
   const [localDataGenerated, setLocalDataGenerated] = useState(false);
   const generateLocalTestData = async () => {
     try {
@@ -301,7 +339,12 @@ export default function App() {
         localStorage.removeItem('tendidoReports');
         
         const savedKmz = localStorage.getItem(`kmzProject_${currentProjectId}`);
-        setKmzProject(savedKmz ? JSON.parse(savedKmz) : null);
+        try {
+          setKmzProject(savedKmz && savedKmz !== 'undefined' ? JSON.parse(savedKmz) : null);
+        } catch (e) {
+          console.error("Error parsing kmzProject:", e);
+          setKmzProject(null);
+        }
         isKmzInitialLoad.current = false;
       } else {
         // Save only after initial load
@@ -398,7 +441,7 @@ export default function App() {
   }, [currentContractorId, storageMode]);
 
   useEffect(() => {
-    if (!isSuperAdmin || storageMode === 'local') return;
+    if ((!user && !techSession) || storageMode === 'local') return;
     const loadBotToken = async () => {
       try {
         const docRef = doc(db, 'system_settings', 'telegram');
@@ -409,11 +452,12 @@ export default function App() {
           localStorage.setItem('telegramBotToken', token);
         }
       } catch (err) {
+        // Silently fail if not admin, but usually system_settings should be readable by team
         console.error("Error loading bot token:", err);
       }
     };
     loadBotToken();
-  }, [isSuperAdmin, storageMode]);
+  }, [user, techSession, storageMode]);
 
   const [isOnline, setIsOnline] = useState(navigator.onLine);
   useEffect(() => {
@@ -427,14 +471,20 @@ export default function App() {
     };
   }, []);
 
-  const sendTelegramNotification = async (message: string, chatId?: string) => {
+  const sendTelegramNotification = async (message: string, chatId?: string, photo?: Blob | File) => {
     const token = telegramBotToken;
     if (!token || !chatId) return;
 
     const queueMessage = (msg: string, cid: string) => {
-      const queue = JSON.parse(localStorage.getItem('telegram_queue') || '[]');
-      queue.push({ msg, cid, timestamp: new Date().toISOString() });
-      localStorage.setItem('telegram_queue', JSON.stringify(queue));
+      try {
+        const saved = localStorage.getItem('telegram_queue');
+        const queue = saved && saved !== 'undefined' ? JSON.parse(saved) : [];
+        queue.push({ msg, cid, timestamp: new Date().toISOString() });
+        localStorage.setItem('telegram_queue', JSON.stringify(queue));
+      } catch (e) {
+        console.error("Error in queueMessage:", e);
+        localStorage.setItem('telegram_queue', JSON.stringify([{ msg, cid, timestamp: new Date().toISOString() }]));
+      }
     };
 
     if (!navigator.onLine) {
@@ -443,18 +493,35 @@ export default function App() {
     }
 
     try {
-      const url = `https://api.telegram.org/bot${token}/sendMessage`;
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: message,
-          parse_mode: 'Markdown'
-        })
-      });
-      if (!response.ok) {
-        queueMessage(message, chatId);
+      if (photo) {
+        const url = `https://api.telegram.org/bot${token}/sendPhoto`;
+        const formData = new FormData();
+        formData.append('chat_id', chatId);
+        formData.append('photo', photo);
+        formData.append('caption', message);
+        formData.append('parse_mode', 'Markdown');
+
+        const response = await fetch(url, {
+          method: 'POST',
+          body: formData
+        });
+        if (!response.ok) {
+          queueMessage(message, chatId);
+        }
+      } else {
+        const url = `https://api.telegram.org/bot${token}/sendMessage`;
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: message,
+            parse_mode: 'Markdown'
+          })
+        });
+        if (!response.ok) {
+          queueMessage(message, chatId);
+        }
       }
     } catch (err) {
       console.error("Error sending Telegram message:", err);
@@ -465,7 +532,15 @@ export default function App() {
   useEffect(() => {
     if (isOnline && telegramBotToken) {
       const processQueue = async () => {
-        const queue: { msg: string, cid: string }[] = JSON.parse(localStorage.getItem('telegram_queue') || '[]');
+        let queue: { msg: string, cid: string }[] = [];
+        try {
+          const saved = localStorage.getItem('telegram_queue');
+          queue = saved && saved !== 'undefined' ? JSON.parse(saved) : [];
+        } catch (e) {
+          console.error("Error loading telegram queue:", e);
+          localStorage.removeItem('telegram_queue');
+        }
+        
         if (queue.length === 0) return;
 
         console.log(`Processing ${queue.length} queued Telegram reports...`);
@@ -535,6 +610,7 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (authLoading || !user || !isAdmin) return;
     const syncLocalProjects = async () => {
       for (let i = 0; i < localStorage.length; i++) {
         const key = localStorage.key(i);
@@ -544,7 +620,9 @@ export default function App() {
           // Check if this project exists in the cloud list
           if (!projects.find(p => p.id === projectId)) {
             try {
-              const localData = JSON.parse(localStorage.getItem(key) || '{}');
+              const saved = localStorage.getItem(key);
+              if (!saved || saved === 'undefined') continue;
+              const localData = JSON.parse(saved);
               if (localData.name) {
                 console.log("Syncing local project to cloud:", localData.name);
                 const newProject: Project = {
@@ -1238,37 +1316,6 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (authLoading) return;
-    const effectiveUserId = user?.uid || techSession?.technicianId;
-    if (!effectiveUserId) {
-      setProjects([]);
-      setCurrentProjectId(null);
-      return;
-    }
-
-    const q = query(
-      collection(db, 'projects'), 
-      where('status', '==', 'active'),
-      where('members', 'array-contains', effectiveUserId)
-    );
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const projectsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Project));
-      setProjects(projectsData);
-      setProjectsLoaded(true);
-      
-      if (!currentProjectId && projectsData.length > 0) {
-        setCurrentProjectId(projectsData[0].id);
-        localStorage.setItem('currentProjectId', projectsData[0].id);
-      }
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'projects');
-    });
-
-    return () => unsubscribe();
-  }, [user, authLoading]);
-
-
-  useEffect(() => {
     const initPending = async () => {
       // Check for pending uploads to resume (only if online and logged in)
       if (user && isOnline) {
@@ -1333,7 +1380,7 @@ export default function App() {
         });
 
         if (match) {
-          return { ...item, status: 'INSTALLED', recordId: match.id };
+          return { ...item, status: 'INSTALLED' as const, recordId: match.id };
         }
         return item;
       });
@@ -1543,14 +1590,14 @@ export default function App() {
   };
 
   const saveReport = async () => {
-    if (!newReport.tendidoId) {
+    if (newReport.tendidoId === undefined || newReport.tendidoId === '') {
       setError("Por favor selecciona un tramo (tendido).");
       return;
     }
-    if (newReport.startMeter === undefined || newReport.endMeter === undefined) {
-      setError("Las abscisas de inicio y fin son obligatorias.");
-      return;
-    }
+    // Final reinforcement that missing values are zero
+    const startM = newReport.startMeter ?? 0;
+    const endM = newReport.endMeter ?? 0;
+
     if (!currentProjectId) {
       setError("No hay un proyecto activo seleccionado.");
       return;
@@ -1567,8 +1614,8 @@ export default function App() {
         finalReport = {
           ...report,
           tendidoId: newReport.tendidoId!,
-          startMeter: newReport.startMeter!,
-          endMeter: newReport.endMeter!,
+          startMeter: startM,
+          endMeter: endM,
           hardware: newReport.hardware as any,
           notes: newReport.notes,
           technician: newReport.technician || report.technician
@@ -1593,8 +1640,8 @@ export default function App() {
           projectId: currentProjectId,
           contractorId: currentContractorId || '',
           tendidoId: newReport.tendidoId!,
-          startMeter: newReport.startMeter!,
-          endMeter: newReport.endMeter!,
+          startMeter: startM,
+          endMeter: endM,
           hardware: newReport.hardware as any,
           notes: newReport.notes,
           timestamp: new Date().toISOString(),
@@ -1652,6 +1699,8 @@ export default function App() {
       }
 
       setNewReport({
+        startMeter: 0,
+        endMeter: 0,
         hardware: { 
           cintaBandi: 0, hevillas: 0, etiquetas: 0, alambre: 0, mensajero: 0, 
           cruceta: 0, brazoCruceta: 0, grillete: 0, chapas: 0, clevi: 0, 
@@ -1727,15 +1776,14 @@ export default function App() {
       // Send Telegram Notification
       const currentProject = projects.find(p => p.id === currentProjectId);
       if (currentProject?.telegramChatId && telegramBotToken) {
-        const msg = `✅ *${item?.type || 'EQUIPO'} CERTIFICADO*\n` +
-          `📋 *Código:* ${item?.name || 'S/N'} (Pendiente Validación IA)\n` +
-          `📍 *Coordenadas:* ${recordToSave.coordinates}\n` +
+        const msg = `✅ *${item?.type || 'EQUIPO'} REGISTRADA*\n` +
+          `📋 *Código:* ${item?.name || 'S/N'}\n` +
           `👷 *Técnico:* ${techSession ? techSession.name : (user?.displayName || user?.email || 'Admin')}\n` +
           `📁 *Proyecto:* ${currentProject.name}\n` +
           `🕐 ${new Date().toLocaleString()}\n` +
           (equipmentReportNotes ? `\n📝 *Nota:* ${equipmentReportNotes}` : '');
         
-        sendTelegramNotification(msg, currentProject.telegramChatId);
+        sendTelegramNotification(msg, currentProject.telegramChatId, equipmentReportFile);
       }
 
       setEquipmentReportFile(null);
@@ -2132,7 +2180,8 @@ export default function App() {
       members: [user?.uid || techSession?.technicianId || 'system'],
       createdAt: new Date().toISOString(),
       createdBy: user?.uid || techSession?.technicianId || 'system',
-      status: 'active'
+      status: 'active',
+      telegramChatId: newProjectTelegramId.trim() || undefined
     };
 
     try {
@@ -2141,6 +2190,7 @@ export default function App() {
         setProjects(updated);
         await storage.saveLocalProjects(currentContractorId, updated);
         setNewProjectName('');
+        setNewProjectTelegramId('');
         setIsCreatingProject(false);
         setCurrentProjectId(projectId);
         localStorage.setItem('currentProjectId', projectId);
@@ -2148,6 +2198,7 @@ export default function App() {
       }
       await setDoc(doc(db, 'projects', projectId), newProject);
       setNewProjectName('');
+      setNewProjectTelegramId('');
       setIsCreatingProject(false);
       setCurrentProjectId(projectId);
       localStorage.setItem('currentProjectId', projectId);
@@ -2588,13 +2639,20 @@ export default function App() {
     // --- SHEET 1: EQUIPOS ---
     const equipData = kmzProject.items.map(item => {
       const match = records.find(r => r.id === item.recordId);
+      
+      // Coordinate priority: Extracted > KMZ
+      const finalCoords = match && match.coordinates ? match.coordinates : `${item.coordinates.lat}, ${item.coordinates.lng}`;
+      const coordOrigin = match && match.coordinates ? 'EXTRACTOR' : 'KMZ';
+      
       return {
         'ETAPA': 'INVENTARIO',
         'TIPO': item.type,
         'NOMBRE KMZ': item.name,
         'ESTADO': item.status === 'INSTALLED' ? 'COMPLETO' : 'INCOMPLETO',
         'CELDA': item.celda || 'N/A',
-        'METRADO/COORD KMZ': `${item.coordinates.lat}, ${item.coordinates.lng}`,
+        'COORDENADAS': finalCoords,
+        'ORIGEN COORD': coordOrigin,
+        'COORD KMZ REF': `${item.coordinates.lat}, ${item.coordinates.lng}`,
         'REPORTE REAL (CODIGO)': match ? match.code : 'PENDIENTE',
         'POTENCIA LEIDA': match ? match.power : 'N/A',
         'FECHA REPORTE': match ? match.extractedAt : 'N/A',
@@ -2609,6 +2667,10 @@ export default function App() {
       const totalReal = reports.reduce((acc, r) => acc + Math.abs(r.endMeter - r.startMeter), 0);
       const diff = isComplete ? totalReal - t.totalDistance : 0;
       
+      // Get all start/end meters
+      const startMeters = reports.map(r => r.startMeter).join('; ');
+      const endMeters = reports.map(r => r.endMeter).join('; ');
+
       // Aggregate hardware from all reports of this tendido
       const hw = reports.reduce((acc, r) => {
         const h = r.hardware;
@@ -2640,6 +2702,8 @@ export default function App() {
         'NOMBRE TENDIDO': t.name,
         'CELDA': t.celda || 'N/A',
         'ESTADO': isComplete ? 'COMPLETO' : 'INCOMPLETO',
+        'PUNTA INICIO': startMeters || 'N/A',
+        'PUNTA FIN': endMeters || 'N/A',
         'DIST. LINEAL (M)': Math.round(t.linearDistance),
         'TOTAL PROYECTADO (M)': Math.round(t.totalDistance),
         'LONGITUD REAL (M)': isComplete ? Math.round(totalReal) : 0,
@@ -2993,7 +3057,7 @@ export default function App() {
           <div className="flex items-center justify-between gap-4 mb-3">
             <div className="flex items-center gap-3">
               <div className="bg-[#141414] p-1.5 sm:p-2">
-                <Table className="text-[#E4E3E0]" size={20} sm:size={24} />
+                <Table className="text-[#E4E3E0] w-5 h-5 sm:w-6 sm:h-6" />
               </div>
               <div>
                 <h1 className="text-lg sm:text-xl font-heading italic leading-none">OPDE</h1>
@@ -3098,13 +3162,14 @@ export default function App() {
                       const currentProject = projects.find(p => p.id === currentProjectId);
                       if (currentProject) {
                         setEditingProjectName(currentProject.name);
+                        setEditingProjectTelegramId(currentProject.telegramChatId || '');
                         setEditingProjectId(currentProject.id);
                       }
                     }}
                     className="p-1 hover:bg-[#141414] hover:text-[#E4E3E0] rounded transition-all text-[#141414]/40"
-                    title="Renombrar"
+                    title="Configurar proyecto"
                   >
-                    <Edit3 size={12} />
+                    <Settings size={12} />
                   </button>
                   <button 
                     onClick={() => {
@@ -4547,27 +4612,66 @@ export default function App() {
             <div className="space-y-6">
               <div className="bg-[#141414] p-8 rounded-3xl text-[#E4E3E0] shadow-2xl space-y-4">
                 <Send size={32} className="text-blue-400" />
-                <h3 className="text-xl font-bold italic font-serif leading-tight">Bot de Telegram</h3>
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xl font-bold italic font-serif leading-tight">Bot de Telegram</h3>
+                  {telegramBotToken && (
+                    <div className="flex items-center gap-2 bg-green-500/10 border border-green-500/20 px-3 py-1 rounded-full">
+                      <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+                      <span className="text-[9px] font-black uppercase text-green-500 tracking-widest">Bot Activo Global</span>
+                    </div>
+                  )}
+                </div>
                 <p className="text-[11px] opacity-60 leading-relaxed font-medium">
-                  Configura el token global del bot para las notificaciones inmediatas.
+                  Configura el token maestro del bot. Este bot será el encargado de enviar TODOS los reportes de TODAS las empresas y proyectos del sistema.
                 </p>
                 <div className="pt-4 border-t border-white/10 space-y-4">
+                  <div className="bg-blue-600/10 border border-blue-400/20 p-4 rounded-2xl space-y-2">
+                    <p className="text-[10px] font-black tracking-widest text-blue-400 uppercase">Guía Maestra</p>
+                    <ol className="text-[10px] space-y-1 list-decimal ml-3 opacity-80 leading-relaxed font-medium">
+                      <li>El bot configurado aquí es el único necesario para todo el sistema.</li>
+                      <li>Solo tú ({user?.email}) puedes modificar este token.</li>
+                      <li>Las empresas individuales solo configuran su respectivo "ID de Chat" para recibir sus reportes.</li>
+                    </ol>
+                  </div>
                   <div className="space-y-2">
-                    <label className="text-[10px] uppercase tracking-widest font-bold opacity-50">Bot Token (BotFather)</label>
+                    <div className="flex justify-between items-center">
+                      <label className="text-[10px] uppercase tracking-widest font-bold opacity-50">Token Global del Bot</label>
+                      {telegramBotToken && (
+                        <span className="text-[9px] opacity-40 font-mono">Token configurado • Secreto</span>
+                      )}
+                    </div>
                     <div className="flex gap-2">
                       <input 
                         type="password"
                         value={telegramBotToken}
                         onChange={(e) => setTelegramBotToken(e.target.value)}
-                        placeholder="7483...:AAH..."
+                        placeholder="Configure el token solo una vez..."
                         className="flex-1 bg-white/5 border border-white/10 rounded-xl p-3 text-xs outline-none focus:border-blue-400 font-mono"
                       />
                       <button 
-                        onClick={() => saveTelegramBotToken(telegramBotToken)}
+                        onClick={async () => {
+                          if (!telegramBotToken) return;
+                          setIsSavingBotToken(true);
+                          try {
+                            const resp = await fetch(`https://api.telegram.org/bot${telegramBotToken}/getMe`);
+                            const data = await resp.json();
+                            if (data.ok) {
+                              await saveTelegramBotToken(telegramBotToken);
+                              setError(null);
+                            } else {
+                              setError("Token de bot inválido. Verifique con BotFather.");
+                            }
+                          } catch (err) {
+                            setError("Error al validar token. Verifique conexión.");
+                          } finally {
+                            setIsSavingBotToken(false);
+                          }
+                        }}
                         disabled={isSavingBotToken}
-                        className="bg-blue-600 p-3 rounded-xl hover:bg-blue-700 transition-all disabled:opacity-50"
+                        className="bg-blue-600 px-4 py-3 rounded-xl hover:bg-blue-700 transition-all disabled:opacity-50 flex items-center gap-2 text-white shadow-lg shadow-blue-600/20"
                       >
                         {isSavingBotToken ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
+                        <span className="text-[10px] font-bold uppercase tracking-widest px-1">Guardar Global</span>
                       </button>
                     </div>
                   </div>
@@ -4744,35 +4848,23 @@ export default function App() {
             </div>
           ) : (
             <div className="p-6 space-y-8 bg-white rounded-xl border border-[#141414]/5 shadow-sm">
-              {isAdmin && (
-                <div className="bg-blue-50/50 p-4 rounded-xl border border-blue-600/10 flex flex-col md:flex-row items-center justify-between gap-4">
-                  <div className="flex items-center gap-3">
-                    <div className="p-2 bg-blue-600 text-white rounded-lg">
-                      <Send size={16} />
-                    </div>
-                    <div>
-                      <p className="text-[10px] font-bold uppercase tracking-widest">Telegram Group Chat ID</p>
-                      <p className="text-[9px] opacity-50">Ingrese el ID numérico (Ej: -100123456789). No use enlaces.</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 w-full md:w-auto">
-                    <input 
-                      type="text"
-                      value={projects.find(p => p.id === currentProjectId)?.telegramChatId || ''}
-                      onChange={(e) => {
-                        const val = e.target.value.trim();
-                        if (val.includes('t.me/')) {
-                          setError("Por favor ingrese el ID numérico del grupo (ej: -100...), no el enlace de invitación.");
-                        }
-                        updateProjectChatId(currentProjectId, val);
-                      }}
-                      placeholder="-100123456789"
-                      className="bg-white border border-[#141414]/10 rounded-lg p-2 text-xs outline-none focus:border-blue-600 w-full md:w-48 font-mono"
-                    />
-                    {isSavingChatId && <Loader2 size={16} className="animate-spin text-blue-600" />}
-                  </div>
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 pb-4 border-b border-[#141414]/5">
+                <div>
+                  <h3 className="text-xl font-bold tracking-tight text-[#141414]">Generación de Reportes</h3>
+                  <p className="text-xs opacity-50">Capture y certifique equipos e inventario en tiempo real.</p>
                 </div>
-              )}
+                {projects.find(p => p.id === currentProjectId)?.telegramChatId ? (
+                  <div className="flex items-center gap-2 bg-green-50 px-3 py-1.5 rounded-full border border-green-100">
+                    <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+                    <span className="text-[9px] font-black text-green-600 uppercase tracking-widest">Telegram Activo: {projects.find(p => p.id === currentProjectId)?.telegramChatId}</span>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 bg-amber-50 px-3 py-1.5 rounded-full border border-amber-100">
+                    <AlertCircle size={10} className="text-amber-500" />
+                    <span className="text-[9px] font-black text-amber-600 uppercase tracking-widest">Telegram no configurado</span>
+                  </div>
+                )}
+              </div>
 
               <div className="flex bg-[#F8F9FA] p-1 rounded-xl w-fit border border-[#141414]/5">
                 <button 
@@ -4831,19 +4923,59 @@ export default function App() {
                         <option value="">Seleccione un tramo...</option>
                         {kmzProject.tendidos
                           .filter(t => !isTechnician || t.assignedTo === techSession?.technicianId)
-                          .map(t => (
-                            <option key={t.id} value={t.id}>{t.name} ({t.type})</option>
-                          ))
+                          .map(t => {
+                            const reports = tendidoReports.filter(r => r.tendidoId === t.id);
+                            const totalReal = reports.reduce((acc, r) => acc + Math.abs(r.endMeter - r.startMeter), 0);
+                            const isComplete = totalReal >= (t.totalDistance * 0.95); // 95% tolerance
+                            const hasProgress = reports.length > 0;
+                            
+                            return (
+                              <option key={t.id} value={t.id}>
+                                {isComplete ? '✅ ' : hasProgress ? '🚧 ' : ''}
+                                {t.name} ({t.type}) {hasProgress ? `- ${Math.round(totalReal)}m / ${Math.round(t.totalDistance)}m` : ''}
+                              </option>
+                            );
+                          })
                         }
                       </select>
+                      {newReport.tendidoId && (() => {
+                        const reports = tendidoReports.filter(r => r.tendidoId === newReport.tendidoId);
+                        if (reports.length === 0) return null;
+                        const total = reports.reduce((acc, r) => acc + Math.abs(r.endMeter - r.startMeter), 0);
+                        const tendido = kmzProject.tendidos.find(t => t.id === newReport.tendidoId);
+                        const progress = tendido ? (total / tendido.totalDistance) * 100 : 0;
+                        const isComplete = progress >= 95;
+
+                        return (
+                          <motion.div 
+                            initial={{ opacity: 0, y: -10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            className={`mt-2 text-[10px] font-black uppercase tracking-tight p-3 rounded-lg border flex items-center justify-between ${
+                              isComplete 
+                                ? 'text-green-700 bg-green-50 border-green-200' 
+                                : 'text-blue-700 bg-blue-50 border-blue-200'
+                            }`}
+                          >
+                            <div className="flex items-center gap-2">
+                              {isComplete ? <CheckCircle size={14} className="shrink-0" /> : <Info size={14} className="shrink-0" />}
+                              <span>
+                                {isComplete 
+                                  ? 'ESTE TRAMO YA FUE REPORTADO SATISFACTORIAMENTE' 
+                                  : `AVANCE DEL TRAMO: ${Math.round(total)}m REPORTADOS (${Math.round(progress)}%)`}
+                              </span>
+                            </div>
+                            {isComplete && <CheckCircle size={14} className="text-green-600" />}
+                          </motion.div>
+                        );
+                      })()}
                     </div>
 
                     <div className="space-y-2">
                       <label className="text-[10px] uppercase tracking-widest font-bold opacity-50">Abscisa Inicio (m)</label>
                       <input 
                         type="number"
-                        value={newReport.startMeter || ''}
-                        onChange={(e) => setNewReport({ ...newReport, startMeter: parseFloat(e.target.value) })}
+                        value={newReport.startMeter ?? ''}
+                        onChange={(e) => setNewReport({ ...newReport, startMeter: e.target.value === '' ? 0 : parseFloat(e.target.value) })}
                         placeholder="0"
                         className="w-full bg-white border border-[#141414]/10 rounded-lg p-3 text-xs outline-none focus:border-blue-600"
                       />
@@ -4853,8 +4985,8 @@ export default function App() {
                       <label className="text-[10px] uppercase tracking-widest font-bold opacity-50">Abscisa Fin (m)</label>
                       <input 
                         type="number"
-                        value={newReport.endMeter || ''}
-                        onChange={(e) => setNewReport({ ...newReport, endMeter: parseFloat(e.target.value) })}
+                        value={newReport.endMeter ?? ''}
+                        onChange={(e) => setNewReport({ ...newReport, endMeter: e.target.value === '' ? 0 : parseFloat(e.target.value) })}
                         placeholder="100"
                         className="w-full bg-white border border-[#141414]/10 rounded-lg p-3 text-xs outline-none focus:border-blue-600"
                       />
@@ -4937,11 +5069,32 @@ export default function App() {
                           <option value="">Seleccione elemento del inventario...</option>
                           {kmzProject.items
                             .filter(i => !isTechnician || i.assignedTo === techSession?.technicianId)
-                            .map(item => (
-                              <option key={item.id} value={item.id}>{item.name} ({item.type} - {item.celda || 'Sin Celda'})</option>
-                            ))
+                            .map(item => {
+                              const isRegistered = item.status === 'INSTALLED' || item.manualStatus === 'INSTALLED';
+                              return (
+                                <option key={item.id} value={item.id}>
+                                  {isRegistered ? '✅ ' : ''}
+                                  {item.name} ({item.type} - {item.celda || 'Sin Celda'})
+                                </option>
+                              );
+                            })
                           }
                         </select>
+                        {selectedInventoryItemId && (() => {
+                          const item = kmzProject.items.find(i => i.id === selectedInventoryItemId);
+                          const isRegistered = item?.status === 'INSTALLED' || item?.manualStatus === 'INSTALLED';
+                          if (!isRegistered) return null;
+                          return (
+                            <motion.div 
+                              initial={{ opacity: 0, scale: 0.95 }}
+                              animate={{ opacity: 1, scale: 1 }}
+                              className="mt-2 text-[10px] font-black uppercase tracking-tight text-green-700 bg-green-50 p-3 rounded-lg border border-green-200 flex items-center gap-2"
+                            >
+                              <CheckCircle size={14} className="shrink-0" />
+                              <span>Este equipo ya fue registrado satisfactoriamente</span>
+                            </motion.div>
+                          );
+                        })()}
                       </div>
 
                       <div className="space-y-2">
@@ -5823,10 +5976,21 @@ export default function App() {
                     value={newProjectName}
                     onChange={(e) => setNewProjectName(e.target.value)}
                     placeholder="Ej. SURCO 12, Lima 13..."
-                    className="w-full bg-white border border-[#141414] px-4 py-3 outline-none focus:ring-2 ring-[#141414]/10 transition-all"
+                    className="w-full bg-white border border-[#141414] px-4 py-3 outline-none focus:ring-2 ring-[#141414]/10 transition-all font-mono"
                     autoFocus
+                  />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <label className="text-[10px] uppercase tracking-widest font-bold opacity-50">Telegram Chat ID (Opcional)</label>
+                  <input 
+                    type="text"
+                    value={newProjectTelegramId}
+                    onChange={(e) => setNewProjectTelegramId(e.target.value)}
+                    placeholder="Ej. -100123456789"
+                    className="w-full bg-white border border-[#141414] px-4 py-3 outline-none focus:ring-2 ring-[#141414]/10 transition-all font-mono"
                     onKeyDown={(e) => e.key === 'Enter' && createProject()}
                   />
+                  <p className="text-[9px] opacity-50 italic">Formato numérico para el bot de reportes</p>
                 </div>
               </div>
 
@@ -6313,13 +6477,13 @@ export default function App() {
               className="bg-[#E4E3E0] p-10 max-w-md w-full rounded-3xl border border-[#141414] shadow-2xl space-y-8"
             >
               <div className="space-y-2">
-                <h2 className="font-serif italic text-4xl leading-tight text-[#141414]">Renombrar Proyecto</h2>
-                <p className="text-[10px] uppercase tracking-[0.3em] font-bold opacity-40">Gestión de Identidad de Proyecto</p>
+                <h2 className="font-serif italic text-4xl leading-tight text-[#141414]">Configurar Proyecto</h2>
+                <p className="text-[10px] uppercase tracking-[0.3em] font-bold opacity-40">Gestión de Identidad y Notificaciones</p>
               </div>
 
               <div className="space-y-6">
                 <div className="flex flex-col gap-3">
-                  <label className="text-[10px] uppercase tracking-widest font-black opacity-50 ml-1">Nuevo Nombre</label>
+                  <label className="text-[10px] uppercase tracking-widest font-black opacity-50 ml-1">Nombre del Proyecto</label>
                   <input 
                     type="text"
                     value={editingProjectName}
@@ -6327,6 +6491,48 @@ export default function App() {
                     className="w-full bg-white border-2 border-[#141414] px-6 py-5 outline-none focus:ring-8 ring-blue-600/10 transition-all font-black text-sm uppercase tracking-tight"
                     autoFocus
                   />
+                </div>
+                <div className="flex flex-col gap-3">
+                  <div className="flex justify-between items-center ml-1">
+                    <label className="text-[10px] uppercase tracking-widest font-black opacity-50">Telegram Chat ID</label>
+                    {editingProjectId && projects.find(p => p.id === editingProjectId)?.telegramChatId && (
+                      <span className="text-[9px] bg-green-100 text-green-700 px-2 py-0.5 rounded-full font-bold">GUARDADO</span>
+                    )}
+                  </div>
+                  <div className="flex gap-2">
+                    <input 
+                      type="text"
+                      value={editingProjectTelegramId}
+                      onChange={(e) => {
+                        const val = e.target.value.trim();
+                        if (val.includes(':')) {
+                          setError("Atención: No ingrese el Token del Bot aquí, solo el ID del grupo (-100...)");
+                        }
+                        setEditingProjectTelegramId(val);
+                      }}
+                      placeholder="Ej. -100123456789"
+                      className="flex-1 bg-white border-2 border-[#141414] px-6 py-5 outline-none focus:ring-8 ring-blue-600/10 transition-all font-black text-sm uppercase tracking-tight"
+                    />
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (!editingProjectTelegramId) {
+                          setError("Ingrese un Chat ID");
+                          return;
+                        }
+                        try {
+                          await sendTelegramNotification("🧪 *PRUEBA DE CONEXIÓN (Edición)*\nSi ves este mensaje, la configuración es correcta.", editingProjectTelegramId);
+                        } catch(e) {
+                          setError("Error al enviar prueba. Verifique el token y el ID.");
+                        }
+                      }}
+                      className="px-6 bg-gray-200 text-gray-800 rounded-xl hover:bg-gray-300 transition-colors"
+                      title="Probar ahora"
+                    >
+                      <Send size={18} />
+                    </button>
+                  </div>
+                  <p className="text-[9px] opacity-40 font-bold ml-1">Para recibir reportes inmediatos en el grupo</p>
                 </div>
               </div>
 
@@ -6339,12 +6545,14 @@ export default function App() {
                 </button>
                 <button 
                   onClick={async () => {
-                    if (!editingProjectName.trim()) return;
+                    const trimmedName = editingProjectName.trim();
+                    const trimmedChatId = editingProjectTelegramId.trim();
+                    if (!trimmedName) return;
                     setIsSaving(true);
                     try {
                       if (storageMode === 'local') {
                         const updated = projects.map(p => 
-                          p.id === editingProjectId ? { ...p, name: editingProjectName.trim() } : p
+                          p.id === editingProjectId ? { ...p, name: trimmedName, telegramChatId: trimmedChatId || undefined } : p
                         );
                         setProjects(updated);
                         if (currentContractorId) {
@@ -6352,19 +6560,22 @@ export default function App() {
                         }
                       } else {
                         const batch = writeBatch(db);
-                        const trimmedName = editingProjectName.trim();
-                        batch.update(doc(db, 'projects', editingProjectId!), { name: trimmedName, lastKmzUpdate: new Date().toISOString() });
+                        batch.update(doc(db, 'projects', editingProjectId!), { 
+                          name: trimmedName, 
+                          telegramChatId: trimmedChatId || deleteField(),
+                          lastKmzUpdate: new Date().toISOString() 
+                        });
                         batch.update(doc(db, 'kmz_projects', editingProjectId!), { name: trimmedName });
                         await batch.commit();
                       }
                       
                       if (kmzProject && kmzProject.id === editingProjectId) {
-                        setKmzProject({ ...kmzProject, name: editingProjectName.trim() });
+                        setKmzProject({ ...kmzProject, name: trimmedName });
                       }
                       setEditingProjectId(null);
                     } catch (err: any) {
-                      console.error("Error renaming project:", err);
-                      setError("Error al renombrar: " + (err.message || "Permiso denegado"));
+                      console.error("Error updating project:", err);
+                      setError("Error al actualizar: " + (err.message || "Permiso denegado"));
                     } finally {
                       setIsSaving(false);
                     }
