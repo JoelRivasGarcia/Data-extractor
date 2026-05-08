@@ -16,7 +16,16 @@ export interface Technician {
 
 export interface EquipmentRecord {
   id: string;
-  imageUrl?: string; // Optional now, as it might be loaded lazily
+  projectId: string;
+  kmzItemId?: string; // Link to inventory item
+  telegramMessageIds?: number[]; // To allow deletion
+  imageUrl?: string; // Legacy/Single photo fallback
+  photos?: {
+    internal?: string;
+    panoramic?: string;
+    certified?: string; // For CTO/MUFA (AI processes this)
+    closeup?: string;   // For Reserva (AI processes this)
+  };
   code: string;
   type: 'CTO' | 'MUFA' | 'RESERVA';
   coordinates: string;
@@ -25,12 +34,13 @@ export interface EquipmentRecord {
   extractedAt: string;
   method?: 'LOCAL' | 'GEMINI' | 'HYBRID';
   aiModel?: string;
+  hasAI?: boolean;
   isNew?: boolean;
   userId?: string;
-  projectId: string;
   contractorId: string; // For isolation
   linkedItemId?: string; // ID from the inventory/KMZ
   notes?: string; 
+  updatedAt?: string;
 }
 
 export interface ProjectIndex {
@@ -46,6 +56,7 @@ export interface EquipmentRecordSummary {
   coordinates: string;
   power: string;
   extractedAt: string;
+  hasAI?: boolean; // New flag to indicate if this record is intended for IA processing
 }
 
 export interface Project {
@@ -131,6 +142,11 @@ export interface TendidoReport {
     otros: string;
   };
   timestamp: string;
+  photos?: {
+    startMeter?: string;
+    endMeter?: string;
+  };
+  telegramMessageIds?: number[];
   technician: string;
   technicianId?: string; // Reference to Technician entity
   notes?: string;

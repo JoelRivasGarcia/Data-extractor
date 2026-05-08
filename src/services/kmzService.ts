@@ -32,10 +32,10 @@ export async function parseKmz(file: File): Promise<{ name: string; items: Inven
     });
   };
 
-  const placemarks = Array.from(xmlDoc.querySelectorAll('Placemark'));
+  const placemarks = Array.from(xmlDoc.getElementsByTagName('Placemark'));
   
   placemarks.forEach(pm => {
-    const name = pm.querySelector('name')?.textContent || 'S/N';
+    const name = pm.getElementsByTagName('name')[0]?.textContent || 'S/N';
     const fullPath = getFolderPath(pm);
     const fullPathUpper = fullPath.toUpperCase();
     
@@ -57,13 +57,13 @@ export async function parseKmz(file: File): Promise<{ name: string; items: Inven
       
       if (type) {
         let itemCelda = '';
-        if (fullPathUpper.includes('CELDAS')) {
-          const parts = fullPath.split(' > ');
-          const partsUpper = fullPathUpper.split(' > ');
-          const celdasIndex = partsUpper.findIndex(p => p.includes('CELDAS'));
-          if (celdasIndex !== -1 && parts[celdasIndex + 1]) {
-            itemCelda = parts[celdasIndex + 1];
-          }
+        const parts = fullPath.split(' > ');
+        const partsUpper = fullPathUpper.split(' > ');
+        
+        // Find any folder part that contains "CELDA"
+        const celdaIndex = partsUpper.findIndex(p => p.includes('CELDA'));
+        if (celdaIndex !== -1) {
+          itemCelda = parts[celdaIndex].trim();
         }
 
         items.push({
@@ -90,13 +90,12 @@ export async function parseKmz(file: File): Promise<{ name: string; items: Inven
       else if (name.toUpperCase().includes('24H')) tendidoType = '24H';
 
       let tendidoCelda = '';
-      if (fullPathUpper.includes('CELDAS')) {
-        const parts = fullPath.split(' > ');
-        const partsUpper = fullPathUpper.split(' > ');
-        const celdasIndex = partsUpper.findIndex(p => p.includes('CELDAS'));
-        if (celdasIndex !== -1 && parts[celdasIndex + 1]) {
-          tendidoCelda = parts[celdasIndex + 1];
-        }
+      const partsT = fullPath.split(' > ');
+      const partsUpperT = fullPathUpper.split(' > ');
+      
+      const celdaIndexT = partsUpperT.findIndex(p => p.includes('CELDA'));
+      if (celdaIndexT !== -1) {
+        tendidoCelda = partsT[celdaIndexT].trim();
       }
 
       tendidos.push({
@@ -117,9 +116,14 @@ export async function parseKmz(file: File): Promise<{ name: string; items: Inven
   function getFolderPath(el: Element): string {
     let path = '';
     let parent = el.parentElement;
-    while (parent && parent.tagName === 'Folder') {
-      const folderName = parent.querySelector('name')?.textContent || '';
-      path = folderName + ' > ' + path;
+    while (parent) {
+      const tagName = parent.tagName.replace(/.*:/, ''); // Handle possible namespaces
+      if (tagName === 'Folder' || tagName === 'Document') {
+        const folderName = Array.from(parent.children).find(c => c.tagName.replace(/.*:/, '') === 'name')?.textContent || '';
+        if (folderName) {
+          path = folderName + ' > ' + path;
+        }
+      }
       parent = parent.parentElement;
     }
     return path;

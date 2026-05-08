@@ -23,6 +23,7 @@ import {
   Wifi,
   WifiOff,
   Database,
+  Edit2,
   Edit3,
   CloudUpload,
   UploadCloud,
@@ -38,6 +39,7 @@ import {
   Eye,
   EyeOff,
   ExternalLink,
+  Camera,
   Info,
   Bell,
   BellRing,
@@ -49,11 +51,13 @@ import {
   ChevronDown,
   Pencil,
   Send,
-  Save
+  Save,
+  Building2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import * as XLSX from 'xlsx';
 import { saveAs } from 'file-saver';
+import JSZip from 'jszip';
 import EXIF from 'exif-js';
 import Tesseract from 'tesseract.js';
 import { EquipmentRecord, Project, InventoryItem, KmzProject, TendidoItem, TendidoReport, EquipmentRecordSummary, ProjectIndex } from './types';
@@ -107,7 +111,7 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState<string>("gemini-flash-latest");
   const [pendingCount, setPendingCount] = useState(0);
   const [showDeleteAllConfirm, setShowDeleteAllConfirm] = useState(false);
-  const [recordToDelete, setRecordToDelete] = useState<string | null>(null);
+  const [recordToDelete, setRecordToDelete] = useState<EquipmentRecord | null>(null);
   const [showDeleteKmzConfirm, setShowDeleteKmzConfirm] = useState(false);
   const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
   const [uploadProgress, setUploadProgress] = useState({ current: 0, total: 0 });
@@ -194,20 +198,18 @@ export default function App() {
   const [editingReportId, setEditingReportId] = useState<string | null>(null);
   const [reportDateFilter, setReportDateFilter] = useState(new Date().toISOString().split('T')[0]);
   const [activeReportMode, setActiveReportMode] = useState<'TENDIDO' | 'EQUIPOS'>('TENDIDO');
-  const [equipmentReportFile, setEquipmentReportFile] = useState<File | null>(null);
+  const [photoInternal, setPhotoInternal] = useState<File | null>(null);
+  const [photoPanoramic, setPhotoPanoramic] = useState<File | null>(null);
+  const [photoCertified, setPhotoCertified] = useState<File | null>(null);
+  const [photoCloseup, setPhotoCloseup] = useState<File | null>(null);
+  const [photoTendidoStart, setPhotoTendidoStart] = useState<File | null>(null);
+  const [photoTendidoEnd, setPhotoTendidoEnd] = useState<File | null>(null);
   const [selectedInventoryItemId, setSelectedInventoryItemId] = useState<string>('');
   const [equipmentReportNotes, setEquipmentReportNotes] = useState('');
   const [isSubmittingEquipment, setIsSubmittingEquipment] = useState(false);
   const [showMetersSummary, setShowMetersSummary] = useState(false);
   const [showHardwareSummary, setShowHardwareSummary] = useState(false);
-  const [storageMode, setStorageMode] = useState<'cloud' | 'local'>(() => {
-    try {
-      const mode = localStorage.getItem('storageMode');
-      return (mode === 'cloud' || mode === 'local') ? mode : 'cloud';
-    } catch (e) {
-      return 'cloud';
-    }
-  });
+  const [storageMode, setStorageMode] = useState<'cloud' | 'local'>('local');
   const [localDataGenerated, setLocalDataGenerated] = useState(false);
   const generateLocalTestData = async () => {
     try {
@@ -338,21 +340,9 @@ export default function App() {
         localStorage.removeItem('kmzProject');
         localStorage.removeItem('tendidoReports');
         
-        const savedKmz = localStorage.getItem(`kmzProject_${currentProjectId}`);
-        try {
-          setKmzProject(savedKmz && savedKmz !== 'undefined' ? JSON.parse(savedKmz) : null);
-        } catch (e) {
-          console.error("Error parsing kmzProject:", e);
-          setKmzProject(null);
-        }
         isKmzInitialLoad.current = false;
       } else {
-        // Save only after initial load
-        if (kmzProject) {
-          localStorage.setItem(`kmzProject_${currentProjectId}`, JSON.stringify(kmzProject));
-        } else {
-          localStorage.removeItem(`kmzProject_${currentProjectId}`);
-        }
+        // Auto-save logic removed in favor of manual saves to avoid frequent large I/O
       }
     } else {
       setKmzProject(null);
@@ -389,13 +379,25 @@ export default function App() {
     const effectiveUserId = user?.uid || techSession?.technicianId;
     if (!effectiveUserId) return;
 
-    // Load projects only for the current contractor and user membership
-    const q = query(
-      collection(db, 'projects'), 
-      where('contractorId', '==', currentContractorId), 
-      where('status', '==', 'active'),
-      where('members', 'array-contains', effectiveUserId)
-    );
+    // Load projects for the current contractor. 
+    // If it's a technician (techSession), show all active projects of the contractor.
+    // If it's a web user, we still filter by membership unless they are super admin or contractor admin.
+    let q;
+    if (techSession) {
+      // Technicians see all active projects of their contractor
+      q = query(
+        collection(db, 'projects'), 
+        where('contractorId', '==', currentContractorId), 
+        where('status', '==', 'active')
+      );
+    } else {
+      q = query(
+        collection(db, 'projects'), 
+        where('contractorId', '==', currentContractorId), 
+        where('status', '==', 'active'),
+        where('members', 'array-contains', effectiveUserId)
+      );
+    }
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Project));
       setProjects(list);
@@ -441,7 +443,7 @@ export default function App() {
   }, [currentContractorId, storageMode]);
 
   useEffect(() => {
-    if ((!user && !techSession) || storageMode === 'local') return;
+    if (!user && !techSession) return;
     const loadBotToken = async () => {
       try {
         const docRef = doc(db, 'system_settings', 'telegram');
@@ -471,9 +473,9 @@ export default function App() {
     };
   }, []);
 
-  const sendTelegramNotification = async (message: string, chatId?: string, photo?: Blob | File) => {
+  const sendTelegramNotification = async (message: string, chatId?: string, photo?: Blob | File): Promise<number | null> => {
     const token = telegramBotToken;
-    if (!token || !chatId) return;
+    if (!token || !chatId) return null;
 
     const queueMessage = (msg: string, cid: string) => {
       try {
@@ -489,7 +491,7 @@ export default function App() {
 
     if (!navigator.onLine) {
       queueMessage(message, chatId);
-      return;
+      return null;
     }
 
     try {
@@ -505,8 +507,13 @@ export default function App() {
           method: 'POST',
           body: formData
         });
-        if (!response.ok) {
+        
+        if (response.ok) {
+          const data = await response.json();
+          return data.result?.message_id || null;
+        } else {
           queueMessage(message, chatId);
+          return null;
         }
       } else {
         const url = `https://api.telegram.org/bot${token}/sendMessage`;
@@ -519,13 +526,19 @@ export default function App() {
             parse_mode: 'Markdown'
           })
         });
-        if (!response.ok) {
+        
+        if (response.ok) {
+          const data = await response.json();
+          return data.result?.message_id || null;
+        } else {
           queueMessage(message, chatId);
+          return null;
         }
       }
     } catch (err) {
       console.error("Error sending Telegram message:", err);
       queueMessage(message, chatId);
+      return null;
     }
   };
 
@@ -572,14 +585,15 @@ export default function App() {
     if (!isSuperAdmin) return;
     setIsSavingBotToken(true);
     try {
-      if (storageMode === 'local') {
-        setTelegramBotToken(token);
-        localStorage.setItem('telegramBotToken', token);
-      } else {
+      // Always try to save to cloud for persistence across devices/reloads
+      try {
         await setDoc(doc(db, 'system_settings', 'telegram'), { botToken: token });
-        setTelegramBotToken(token);
-        localStorage.setItem('telegramBotToken', token);
+      } catch (cloudErr) {
+        console.warn("No se pudo guardar el token en la nube (posible modo local u offline):", cloudErr);
       }
+      
+      setTelegramBotToken(token);
+      localStorage.setItem('telegramBotToken', token);
     } catch (err) {
       console.error("Error saving bot token:", err);
       setError("Error al guardar token de Telegram.");
@@ -682,7 +696,7 @@ export default function App() {
     // Save to storage
     try {
       if (storageMode === 'local') {
-        localStorage.setItem(`kmzProject_${currentProjectId}`, JSON.stringify(newKmz));
+        await storage.saveKmzProject(currentProjectId, newKmz);
       } else {
         await setDoc(doc(db, 'kmz_projects', currentProjectId), newKmz);
         // Also update the project's last update timestamp
@@ -965,7 +979,7 @@ export default function App() {
   const lastKmzUpdate = currentProjectMetadata?.lastKmzUpdate;
 
   useEffect(() => {
-    if (authLoading || !user || !currentProjectId) {
+    if (authLoading || (!user && !techSession) || !currentProjectId) {
       // Don't clear if we're parsing or just uploaded
       if (!currentProjectId && !isParsingKmz) {
         setKmzProject(null);
@@ -974,16 +988,27 @@ export default function App() {
     }
 
     const loadProjectData = async () => {
-      // 1. Try local storage first
-      const saved = localStorage.getItem(`kmzProject_${currentProjectId}`);
-      let localData: KmzProject | null = null;
-      if (saved) {
-        try {
-          localData = JSON.parse(saved);
-          setKmzProject(localData);
-        } catch (e) {
-          console.error("Error parsing cached KMZ:", e);
+      // 1. Try local storage (IndexedDB) first
+      let localData = await storage.getKmzProject(currentProjectId);
+      
+      // Migration from old localStorage format if needed
+      if (!localData) {
+        const saved = localStorage.getItem(`kmzProject_${currentProjectId}`);
+        if (saved) {
+          try {
+            localData = JSON.parse(saved);
+            // Migrate to IndexedDB
+            await storage.saveKmzProject(currentProjectId, localData);
+            // Cleanup to free space
+            localStorage.removeItem(`kmzProject_${currentProjectId}`);
+          } catch (e) {
+            console.error("Error parsing legacy KMZ:", e);
+          }
         }
+      }
+
+      if (localData) {
+        setKmzProject(localData);
       }
 
       // 2. Fetch from Cloud ONLY if metadata says it's newer or we have no local data
@@ -993,7 +1018,6 @@ export default function App() {
       const needsReload = !localData || (projectDoc?.lastKmzUpdate && localData.uploadedAt !== projectDoc.lastKmzUpdate);
 
       if (!needsReload && localData) {
-        console.log("KMZ structure loaded from cache (Static).");
         return;
       }
 
@@ -1007,7 +1031,7 @@ export default function App() {
           }
           
           setKmzProject(cloudData);
-          localStorage.setItem(`kmzProject_${currentProjectId}`, JSON.stringify(cloudData));
+          await storage.saveKmzProject(currentProjectId, cloudData);
           console.log("KMZ structure refreshed from cloud.");
         }
       } catch (error) {
@@ -1022,7 +1046,7 @@ export default function App() {
     if (!isParsingKmz) {
       loadProjectData();
     }
-  }, [user, authLoading, currentProjectId, isParsingKmz, lastKmzUpdate, storageMode]);
+  }, [user, techSession, authLoading, currentProjectId, isParsingKmz, lastKmzUpdate, storageMode]);
 
   const requestNotificationPermission = async () => {
     if (!("Notification" in window)) return;
@@ -1247,7 +1271,13 @@ export default function App() {
       });
       
       const updatedKmz = { ...kmzProject, items: itemsToUpdate, tendidos: tendidosToUpdate };
-      await setDoc(doc(db, 'kmz_projects', currentProjectId), updatedKmz);
+      
+      if (storageMode === 'local') {
+        await storage.saveKmzProject(currentProjectId, updatedKmz);
+      } else {
+        await setDoc(doc(db, 'kmz_projects', currentProjectId), updatedKmz);
+      }
+      
       setKmzProject(updatedKmz);
       setSelectedInventoryItems(new Set());
       setAssignmentTechId('');
@@ -1400,45 +1430,43 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    setIsParsingKmz(true);
-    try {
-      const { name: kmzInternalName, items, tendidos } = await parseKmz(file);
-      
-      // 1. Prioritize Current Project ID if exists
-      // 2. Fallback to same-name project search
-      // 3. Last fallback: New UUID
-      const currentProj = currentProjectId ? projects.find(p => p.id === currentProjectId) : null;
-      const existingProjByName = !currentProjectId ? projects.find(p => p.name.toUpperCase() === kmzInternalName.toUpperCase()) : null;
-      
-      const targetProjectId = currentProjectId || (existingProjByName ? existingProjByName.id : crypto.randomUUID());
-      const targetProjectName = currentProj ? currentProj.name : (existingProjByName ? existingProjByName.name : kmzInternalName);
-      
-      // Prevent useEffect from overwriting the fresh upload with empty localStorage
-      isKmzInitialLoad.current = false;
-      lastProjectId.current = targetProjectId;
+      setIsParsingKmz(true);
+      setError(null); // Clear previous errors
+      try {
+        const { name: kmzInternalName, items, tendidos } = await parseKmz(file);
+        
+        // 1. Prioritize Current Project ID if exists
+        // 2. Fallback to same-name project search
+        // 3. Last fallback: New UUID
+        const currentProj = currentProjectId ? projects.find(p => p.id === currentProjectId) : null;
+        const existingProjByName = !currentProjectId ? projects.find(p => p.name.toUpperCase() === kmzInternalName.toUpperCase()) : null;
+        
+        const targetProjectId = currentProjectId || (existingProjByName ? existingProjByName.id : crypto.randomUUID());
+        const targetProjectName = currentProj ? currentProj.name : (existingProjByName ? existingProjByName.name : kmzInternalName);
+        
+        // Prevent useEffect from overwriting the fresh upload with empty storage
+        isKmzInitialLoad.current = false;
+        lastProjectId.current = targetProjectId;
 
-      const newUploadedAt = new Date().toISOString();
+        const newUploadedAt = new Date().toISOString();
+        const kmzData = {
+          id: targetProjectId,
+          name: targetProjectName,
+          items,
+          tendidos,
+          uploadedAt: newUploadedAt
+        };
 
-      setKmzProject({
-        id: targetProjectId,
-        name: targetProjectName,
-        items,
-        tendidos,
-        uploadedAt: newUploadedAt
-      });
-      
-      setCurrentProjectId(targetProjectId);
-      localStorage.setItem('currentProjectId', targetProjectId);
-      localStorage.setItem(`kmzProject_${targetProjectId}`, JSON.stringify({
-        id: targetProjectId,
-        name: targetProjectName,
-        items,
-        tendidos,
-        uploadedAt: newUploadedAt
-      }));
+        setKmzProject(kmzData);
+        
+        setCurrentProjectId(targetProjectId);
+        localStorage.setItem('currentProjectId', targetProjectId);
+        
+        // Save to IndexedDB (much larger capacity than localStorage)
+        await storage.saveKmzProject(targetProjectId, kmzData);
 
-      // Save project metadata and KMZ structure to Firestore
-      if (user) {
+        // Save project metadata and KMZ structure to Firestore
+      if (user && storageMode === 'cloud') {
         // If it's a new project shell, we create it; otherwise update lastKmzUpdate
         const isNew = !projects.some(p => p.id === targetProjectId);
         
@@ -1471,12 +1499,35 @@ export default function App() {
         });
         
         await batch.commit();
+      } else if (storageMode === 'local') {
+        // In local mode, if it's a new project, we should ensure it exists in local projects list
+        const isNew = !projects.some(p => p.id === targetProjectId);
+        if (isNew && currentContractorId) {
+          const newProject: Project = {
+            id: targetProjectId,
+            name: targetProjectName,
+            contractorId: currentContractorId,
+            members: [user?.uid || 'local-user'],
+            createdAt: newUploadedAt,
+            createdBy: user?.uid || 'local-user',
+            status: 'active',
+            lastKmzUpdate: newUploadedAt
+          };
+          const updatedProjects = [...projects, newProject];
+          setProjects(updatedProjects);
+          await storage.saveLocalProjects(currentContractorId, updatedProjects);
+        }
       }
 
       setActiveTab('INVENTORY');
     } catch (err) {
-      console.error("Error parsing KMZ:", err);
-      setError("No se pudo procesar el archivo KMZ. Asegúrate de que sea un archivo válido de Google Earth.");
+      console.error("Error processing KMZ:", err);
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      if (errorMessage.includes('quota') || errorMessage.includes('Disk full') || errorMessage.includes('QuotaExceededError')) {
+        setError("El almacenamiento local está lleno. Intenta borrar otros proyectos o usar un navegador diferente.");
+      } else {
+        setError(`Error al procesar KMZ: ${errorMessage}. Verifica que sea un archivo válido de Google Earth.`);
+      }
     } finally {
       setIsParsingKmz(false);
       if (e.target) e.target.value = '';
@@ -1487,12 +1538,20 @@ export default function App() {
     setNewlyAddedIds(new Set());
   };
 
-  const deleteTendido = (id: string) => {
+  const deleteTendido = async (id: string) => {
     if (!kmzProject) return;
-    setKmzProject({
+    const updatedKmz = {
       ...kmzProject,
       tendidos: kmzProject.tendidos.filter(t => t.id !== id)
-    });
+    };
+    
+    if (storageMode === 'local') {
+      await storage.saveKmzProject(currentProjectId, updatedKmz);
+    } else if (user) {
+      await setDoc(doc(db, 'kmz_projects', currentProjectId), updatedKmz);
+    }
+    
+    setKmzProject(updatedKmz);
   };
 
   const copyReportToClipboard = (report: TendidoReport) => {
@@ -1554,6 +1613,8 @@ export default function App() {
       notes: report.notes || '',
       technician: report.technician || ''
     });
+    setPhotoTendidoStart(null);
+    setPhotoTendidoEnd(null);
     setActiveTab('REPORTS');
     // Scroll to form
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -1563,6 +1624,31 @@ export default function App() {
     if (!currentProjectId) return;
     
     try {
+      const reportToDelete = tendidoReports.find(r => r.id === id);
+      if (reportToDelete?.photos) {
+        if (reportToDelete.photos.startMeter) await storage.deleteBlob(reportToDelete.photos.startMeter);
+        if (reportToDelete.photos.endMeter) await storage.deleteBlob(reportToDelete.photos.endMeter);
+      }
+
+      // Delete Telegram messages if present
+      const currentProject = projects.find(p => p.id === currentProjectId);
+      if (currentProject?.telegramChatId && telegramBotToken && reportToDelete?.telegramMessageIds) {
+        for (const msgId of reportToDelete.telegramMessageIds) {
+          try {
+            await fetch(`https://api.telegram.org/bot${telegramBotToken}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: currentProject.telegramChatId,
+                message_id: msgId
+              })
+            });
+          } catch (e) {
+            console.error("Error deleting tendido telegram message:", e);
+          }
+        }
+      }
+
       if (storageMode === 'local') {
         const updated = tendidoReports.filter(r => r.id !== id);
         setTendidoReports(updated);
@@ -1594,14 +1680,22 @@ export default function App() {
     setEditTendidoName(tendido.name);
   };
 
-  const saveTendidoEdit = () => {
+  const saveTendidoEdit = async () => {
     if (!kmzProject || !editingTendidoId) return;
-    setKmzProject({
+    const updatedKmz = {
       ...kmzProject,
       tendidos: kmzProject.tendidos.map(t => 
         t.id === editingTendidoId ? { ...t, name: editTendidoName } : t
       )
-    });
+    };
+    
+    if (storageMode === 'local') {
+      await storage.saveKmzProject(currentProjectId, updatedKmz);
+    } else if (user) {
+      await setDoc(doc(db, 'kmz_projects', currentProjectId), updatedKmz);
+    }
+    
+    setKmzProject(updatedKmz);
     setEditingTendidoId(null);
   };
 
@@ -1622,19 +1716,35 @@ export default function App() {
     setIsSaving(true);
     try {
       let finalReport: TendidoReport;
-      
-      if (editingReportId) {
-        const report = tendidoReports.find(r => r.id === editingReportId);
-        if (!report) return;
+      const recordId = editingReportId || crypto.randomUUID();
 
+      // Compress and save photos
+      const compressed: Record<string, Blob> = {};
+      if (photoTendidoStart) compressed.startMeter = await compressImage(photoTendidoStart);
+      if (photoTendidoEnd) compressed.endMeter = await compressImage(photoTendidoEnd);
+
+      for (const [key, blob] of Object.entries(compressed)) {
+        await storage.saveBlob(`${recordId}_${key}`, blob);
+      }
+
+      const existingReport = editingReportId ? tendidoReports.find(r => r.id === editingReportId) : null;
+      const telegramMessageIds: number[] = existingReport?.telegramMessageIds || [];
+
+      if (editingReportId && existingReport) {
         finalReport = {
-          ...report,
+          ...existingReport,
           tendidoId: newReport.tendidoId!,
           startMeter: startM,
           endMeter: endM,
           hardware: newReport.hardware as any,
           notes: newReport.notes,
-          technician: newReport.technician || report.technician
+          technician: newReport.technician || existingReport.technician,
+          photos: {
+            ...(existingReport.photos || {}),
+            ...(compressed.startMeter ? { startMeter: `${recordId}_startMeter` } : {}),
+            ...(compressed.endMeter ? { endMeter: `${recordId}_endMeter` } : {}),
+          },
+          telegramMessageIds
         };
 
         if (storageMode === 'local') {
@@ -1652,7 +1762,7 @@ export default function App() {
         setEditingReportId(null);
       } else {
         finalReport = {
-          id: crypto.randomUUID(),
+          id: recordId,
           projectId: currentProjectId,
           contractorId: currentContractorId || '',
           tendidoId: newReport.tendidoId!,
@@ -1662,7 +1772,12 @@ export default function App() {
           notes: newReport.notes,
           timestamp: new Date().toISOString(),
           technician: techSession ? techSession.name : (user?.displayName || user?.email || 'Admin'),
-          technicianId: techSession?.technicianId
+          technicianId: techSession?.technicianId,
+          photos: {
+            ...(compressed.startMeter ? { startMeter: `${recordId}_startMeter` } : {}),
+            ...(compressed.endMeter ? { endMeter: `${recordId}_endMeter` } : {}),
+          },
+          telegramMessageIds
         };
 
         if (storageMode === 'local') {
@@ -1680,9 +1795,25 @@ export default function App() {
         setShowReportSummary(finalReport);
       }
 
-      // Send Telegram Notification
+      // Send Telegram Notification with Photos
       const currentProject = projects.find(p => p.id === currentProjectId);
       if (currentProject?.telegramChatId && telegramBotToken) {
+        // 1. If editing, try to delete previous messages to avoid clutter
+        if (editingReportId && existingReport?.telegramMessageIds) {
+          for (const msgId of existingReport.telegramMessageIds) {
+            try {
+              await fetch(`https://api.telegram.org/bot${telegramBotToken}/deleteMessage`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: currentProject.telegramChatId,
+                  message_id: msgId
+                })
+              });
+            } catch (e) {}
+          }
+        }
+
         const tendido = kmzProject?.tendidos.find(t => t.id === finalReport.tendidoId);
         const hwLabels: Record<string, string> = {
           cintaBandi: 'Cinta Bandi', hevillas: 'Hevillas', etiquetas: 'Etiquetas',
@@ -1701,18 +1832,80 @@ export default function App() {
         if (finalReport.hardware.otros) {
           hwText += `- Otros: ${finalReport.hardware.otros}\n`;
         }
+        if (finalReport.notes) {
+          hwText += `\n📝 *Nota:* ${finalReport.notes}`;
+        }
 
-        const msg = `✅ *REPORTE DE TENDIDO*\n` +
+        const isComplete = finalReport.startMeter > 0 && finalReport.endMeter > 0;
+        const totalDist = Math.abs(finalReport.endMeter - finalReport.startMeter);
+
+        const baseMsg = `✅ *REPORTE DE TENDIDO ${isComplete ? 'COMPLETO' : 'PARCIAL'}*\n` +
           `📁 *Tramo:* ${tendido?.name || 'N/A'}\n` +
-          `📏 *Distancia:* ${finalReport.startMeter}m - ${finalReport.endMeter}m (Total: ${Math.abs(finalReport.endMeter - finalReport.startMeter)}m)\n` +
+          `📏 *Abscisas:* ${finalReport.startMeter}m - ${finalReport.endMeter || 'PENDIENTE'}m\n` +
+          `${isComplete ? `📐 *Total Tendido:* ${totalDist}m\n` : ''}` +
           `🎞️ *Tipo:* ${tendido?.type || 'N/A'}\n` +
           `👷 *Técnico:* ${finalReport.technician}\n` +
           `📁 *Proyecto:* ${currentProject.name}\n` +
           `🕐 ${new Date(finalReport.timestamp).toLocaleString()}\n\n` +
-          `📦 *FERRETERÍA:*\n${hwText || '- Ninguna reported'}`;
+          `📦 *FERRETERÍA:*\n${hwText || '- Ninguna reportada'}`;
         
-        sendTelegramNotification(msg, currentProject.telegramChatId);
+        // Fetch all existing photos for this report to send them together
+        const startPhotoId = finalReport.photos?.startMeter;
+        const endPhotoId = finalReport.photos?.endMeter;
+        
+        const photoBlobs: { label: string, blob: Blob }[] = [];
+        
+        if (startPhotoId) {
+          try {
+            const b = await storage.getBlob(startPhotoId);
+            if (b) photoBlobs.push({ label: 'PUNTA INICIAL', blob: b });
+          } catch (e) {}
+        }
+        if (endPhotoId) {
+          try {
+            const b = await storage.getBlob(endPhotoId);
+            if (b) photoBlobs.push({ label: 'PUNTA FINAL', blob: b });
+          } catch (e) {}
+        }
+
+        if (photoBlobs.length > 0) {
+          const newMsgIds: number[] = [];
+          for (const p of photoBlobs) {
+            const msgId = await sendTelegramNotification(`${baseMsg}\n\n📷 *Evidencia:* ${p.label}`, currentProject.telegramChatId, p.blob);
+            if (msgId) newMsgIds.push(msgId);
+          }
+          
+          finalReport.telegramMessageIds = newMsgIds;
+          
+          // Update report with new telegram IDs
+          if (storageMode === 'local') {
+            const updated = tendidoReports.map(r => r.id === finalReport.id ? finalReport : r);
+            setTendidoReports(updated);
+            await storage.saveLocalReports(currentProjectId, updated);
+          } else {
+            await updateDoc(doc(db, 'tendido_reports', finalReport.id), {
+              telegramMessageIds: finalReport.telegramMessageIds
+            });
+          }
+        } else {
+          const msgId = await sendTelegramNotification(baseMsg, currentProject.telegramChatId);
+          if (msgId) {
+            finalReport.telegramMessageIds = [msgId];
+            if (storageMode === 'local') {
+              const updated = tendidoReports.map(r => r.id === finalReport.id ? finalReport : r);
+              setTendidoReports(updated);
+              await storage.saveLocalReports(currentProjectId, updated);
+            } else {
+              await updateDoc(doc(db, 'tendido_reports', finalReport.id), {
+                telegramMessageIds: finalReport.telegramMessageIds
+              });
+            }
+          }
+        }
       }
+
+      setPhotoTendidoStart(null);
+      setPhotoTendidoEnd(null);
 
       setNewReport({
         startMeter: 0,
@@ -1738,76 +1931,384 @@ export default function App() {
     }
   };
 
+  const deleteRecord = async (record: EquipmentRecord) => {
+    if (!currentProjectId) {
+      setRecordToDelete(null);
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      // 1. Delete blobs
+      const photoKeys = ['internal', 'panoramic', 'certified', 'closeup'];
+      for (const key of photoKeys) {
+        const storageId = (record.photos as any)?.[key];
+        if (storageId) {
+          await storage.deleteBlob(storageId);
+        }
+      }
+      await storage.deleteBlob(record.id); // main file
+
+      // 2. Delete messages from Telegram if possible
+      const currentProject = projects.find(p => p.id === currentProjectId);
+      if (currentProject?.telegramChatId && telegramBotToken && record.telegramMessageIds) {
+        for (const msgId of record.telegramMessageIds) {
+          try {
+            await fetch(`https://api.telegram.org/bot${telegramBotToken}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: currentProject.telegramChatId,
+                message_id: msgId
+              })
+            });
+          } catch (e) {
+            console.error("Error deleting telegram message:", e);
+          }
+        }
+      }
+
+      if (storageMode === 'local') {
+        const currentRecords = await storage.loadRecords(currentProjectId);
+        const updated = currentRecords.filter(r => r.id !== record.id);
+        await storage.saveRecords(currentProjectId, updated);
+        setRecords(updated);
+      } else {
+        const batch = writeBatch(db);
+        batch.delete(doc(db, 'records', record.id));
+        batch.delete(doc(db, 'record_images', record.id)); // legacy
+
+        const summary: EquipmentRecordSummary = {
+          id: record.id,
+          code: record.code,
+          type: record.type,
+          coordinates: record.coordinates,
+          power: record.power,
+          extractedAt: record.extractedAt
+        };
+        batch.update(doc(db, 'project_indexes', currentProjectId), {
+          items: arrayRemove(summary)
+        });
+        
+        batch.update(doc(db, 'projects', currentProjectId), {
+          lastRecordsUpdate: new Date().toISOString()
+        });
+
+        await batch.commit();
+        setRecords(prev => prev.filter(r => r.id !== record.id));
+      }
+
+      // 4. Reset KMZ item status
+      if (kmzProject && record.linkedItemId) {
+        const updatedItems = kmzProject.items.map(i => 
+          i.id === record.linkedItemId ? { ...i, status: 'PENDING' as const } : i
+        );
+        const updatedKmz = { ...kmzProject, items: updatedItems };
+        setKmzProject(updatedKmz);
+        
+        if (storageMode === 'local') {
+          localStorage.setItem(`kmzProject_${currentProjectId}`, JSON.stringify(updatedKmz));
+        } else {
+          await updateDoc(doc(db, 'kmz_projects', currentProjectId), { items: updatedItems });
+        }
+      }
+
+      // Success
+    } catch (err: any) {
+      console.error(err);
+      setError("Error al eliminar el reporte.");
+    } finally {
+      setIsSaving(false);
+      setRecordToDelete(null);
+    }
+  };
+
+  const exportToZip = async () => {
+    if (!currentProjectId || records.length === 0) return;
+    
+    setIsSaving(true);
+    setModalError(null);
+    try {
+      const zip = new JSZip();
+      const project = projects.find(p => p.id === currentProjectId);
+      const projectName = project?.name || 'proyecto';
+      
+      const sanitize = (name: string) => (name || '').replace(/[/\\?%*:|"<>]/g, '-').trim();
+      
+      const rootFolderName = `${sanitize(projectName)}_fotos`;
+      const rootFolder = zip.folder(rootFolderName);
+      
+      if (!rootFolder) throw new Error("No se pudo crear el directorio raíz del ZIP");
+
+      let addedCount = 0;
+
+      for (const record of records) {
+        // Use the code if available, otherwise use KMZ item's name if we can find it
+        let baseName = record.code && record.code !== 'SIN_PROCESAR' ? record.code : '';
+        
+        if (!baseName) {
+          const itemId = record.linkedItemId || record.kmzItemId;
+          if (itemId && kmzProject) {
+            const item = kmzProject.items.find(i => i.id === itemId);
+            if (item) baseName = item.name;
+          }
+        }
+        
+        if (!baseName) {
+          baseName = `REPORT_${record.id.substring(0, 8)}`;
+        }
+
+        const folderName = sanitize(baseName);
+        const codeFolder = rootFolder.folder(folderName);
+        if (!codeFolder) continue;
+
+        const photos = record.photos || {};
+        
+        // Safety for date
+        let validDate = new Date();
+        try {
+          if (record.timestamp) {
+            const d = new Date(record.timestamp);
+            if (!isNaN(d.getTime())) {
+              validDate = d;
+            }
+          } else if (record.extractedAt) {
+            const d = new Date(record.extractedAt);
+            if (!isNaN(d.getTime())) {
+              validDate = d;
+            }
+          }
+        } catch (e) {}
+
+        const ts = validDate.toISOString().replace(/[:.]/g, '-');
+
+        const photoKeys = [
+          { key: 'internal', label: 'INTERNA' },
+          { key: 'panoramic', label: 'PANORAMICA' },
+          { key: 'certified', label: 'CERTIFICADA' },
+          { key: 'closeup', label: 'DE_CERCA' }
+        ];
+
+        for (const photoType of photoKeys) {
+          const storageId = (photos as any)[photoType.key];
+          if (storageId) {
+            const blob = await storage.getBlob(storageId);
+            if (blob) {
+              codeFolder.file(`${folderName}_${ts}_${photoType.label}.jpg`, blob);
+              addedCount++;
+            }
+          }
+        }
+        
+        // Fallback for legacy records or single-photo records
+        if (!record.photos && record.id) {
+          const blob = await storage.getBlob(record.id);
+          if (blob) {
+            codeFolder.file(`${folderName}_FOTO_UNICA.jpg`, blob);
+            addedCount++;
+          }
+        }
+      }
+
+      if (addedCount === 0) {
+        throw new Error("No se encontraron fotos locales para exportar. Nota: Solo se pueden exportar fotos tomadas en este dispositivo.");
+      }
+
+      const content = await zip.generateAsync({ type: "blob" });
+      saveAs(content, `${sanitize(projectName)}_fotos_full.zip`);
+      
+    } catch (err: any) {
+      console.error("Error creating zip:", err);
+      setError(`Error al generar ZIP: ${err.message || 'Error desconocido'}`);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   const submitEquipmentReport = async () => {
-    if (!equipmentReportFile || !currentProjectId || !user) {
+    const item = kmzProject?.items.find(i => i.id === selectedInventoryItemId);
+    const itemType = item?.type || 'CTO';
+
+    // Find if there is an existing record for this item to update it
+    const existingRecord = records.find(r => r.linkedItemId === selectedInventoryItemId || r.kmzItemId === selectedInventoryItemId);
+
+    // Validation: At least one NEW photo or all must be present eventually
+    const anyNewPhoto = photoInternal || photoPanoramic || photoCertified || photoCloseup;
+    
+    if (!anyNewPhoto && !existingRecord) {
+      setError("Debes seleccionar al menos una foto para iniciar el reporte.");
+      return;
+    }
+
+    if (!currentProjectId || !user) {
       setError("Faltan datos obligatorios para el reporte de equipo.");
       return;
     }
 
     setIsSubmittingEquipment(true);
     try {
-      const { coordinates, timestamp: exifTimestamp } = await getExifData(equipmentReportFile);
-      const item = kmzProject?.items.find(i => i.id === selectedInventoryItemId);
-      const newRecordId = crypto.randomUUID();
-      const newRecord: EquipmentRecord = {
-        id: newRecordId,
-        projectId: currentProjectId,
-        contractorId: currentContractorId || '',
-        userId: user.uid,
-        imageUrl: '', // Will be updated later or handled in sync
-        code: 'SIN_PROCESAR', 
-        type: item?.type || 'CTO', 
-        coordinates: coordinates || '0, 0',
-        timestamp: exifTimestamp || new Date().toISOString(),
-        power: 'PENDIENTE',
-        extractedAt: new Date().toISOString(),
-        isNew: true,
-        method: 'LOCAL',
-        linkedItemId: selectedInventoryItemId || undefined
-      };
+      // 1. Determine which photo is for AI extraction
+      const aiPhoto = itemType === 'RESERVA' ? photoCloseup : photoCertified;
+      
+      let coordinates = '0, 0';
+      let exifTimestamp = new Date().toISOString();
 
-      const extraNotes = `[Reportado desde Inventario: ${item?.name || 'Desconocido'}] ${equipmentReportNotes}`;
-      const recordToSave = { ...newRecord, notes: extraNotes };
-
-      // Save the blob locally regardless of storage mode for testing/preview
-      await storage.saveBlob(newRecordId, equipmentReportFile);
-
-      if (storageMode === 'local') {
-        const currentRecords = await storage.loadRecords(currentProjectId);
-        const updated = [recordToSave as any, ...currentRecords];
-        await storage.saveRecords(currentProjectId, updated);
-        setRecords(updated);
-      } else {
-        await setDoc(doc(db, 'records', newRecordId), recordToSave);
-        await updateDoc(doc(db, 'projects', currentProjectId), { 
-          lastRecordsUpdate: new Date().toISOString() 
-        });
-        // Optimistic update for cloud mode to ensure immediate feedback
-        setRecords(prev => [recordToSave, ...prev]);
+      if (aiPhoto) {
+        // Extract EXIF from AI Photo if provided
+        const exif = await getExifData(aiPhoto);
+        if (exif.coordinates) coordinates = exif.coordinates;
+        if (exif.timestamp) exifTimestamp = exif.timestamp;
+      } else if (anyNewPhoto) {
+        // Extract EXIF from any new photo
+        const firstPhoto = photoInternal || photoPanoramic || photoCloseup || photoCertified;
+        if (firstPhoto) {
+          const exif = await getExifData(firstPhoto);
+          if (exif.coordinates) coordinates = exif.coordinates;
+          if (exif.timestamp) exifTimestamp = exif.timestamp;
+        }
       }
 
-      // Automatically trigger extraction for faster feedback on photo validity
-      processFiles([recordToSave]);
+      const recordId = crypto.randomUUID();
 
-      // Send Telegram Notification
+      // 3. Compress new photos
+      const newPhotosToCompress: Record<string, File | null> = itemType === 'RESERVA' 
+        ? { closeup: photoCloseup, panoramic: photoPanoramic }
+        : { internal: photoInternal, panoramic: photoPanoramic, certified: photoCertified };
+
+      const compressedPhotos: Record<string, Blob> = {};
+      for (const [key, photo] of Object.entries(newPhotosToCompress)) {
+        if (photo) {
+           compressedPhotos[key] = await compressImage(photo);
+        }
+      }
+
+      // 4. Save new blobs locally
+      for (const [key, blob] of Object.entries(compressedPhotos)) {
+        await storage.saveBlob(`${recordId}_${key}`, blob);
+      }
+      
+      // Update the main blob for compatibility
+      const mainBlob = compressedPhotos[itemType === 'RESERVA' ? 'closeup' : 'certified'];
+      if (mainBlob) {
+        await storage.saveBlob(recordId, mainBlob);
+      }
+
+      const updatedPhotos = {
+        ...(compressedPhotos.internal ? { internal: `${recordId}_internal` } : {}),
+        ...(compressedPhotos.panoramic ? { panoramic: `${recordId}_panoramic` } : {}),
+        ...(compressedPhotos.certified ? { certified: `${recordId}_certified` } : {}),
+        ...(compressedPhotos.closeup ? { closeup: `${recordId}_closeup` } : {}),
+      };
+
+      const telegramMessageIds: number[] = [];
+
+      // 6. Send new photos to Telegram
       const currentProject = projects.find(p => p.id === currentProjectId);
-      if (currentProject?.telegramChatId && telegramBotToken) {
-        const msg = `✅ *${item?.type || 'EQUIPO'} REGISTRADA*\n` +
+      if (currentProject?.telegramChatId && telegramBotToken && Object.keys(compressedPhotos).length > 0) {
+        const baseMsg = `✅ *${itemType} REGISTRADA*\n` +
           `📋 *Código:* ${item?.name || 'S/N'}\n` +
           `👷 *Técnico:* ${techSession ? techSession.name : (user?.displayName || user?.email || 'Admin')}\n` +
           `📁 *Proyecto:* ${currentProject.name}\n` +
           `🕐 ${new Date().toLocaleString()}\n` +
           (equipmentReportNotes ? `\n📝 *Nota:* ${equipmentReportNotes}` : '');
         
-        sendTelegramNotification(msg, currentProject.telegramChatId, equipmentReportFile);
+        for (const [key, blob] of Object.entries(compressedPhotos)) {
+          const typeLabel = key === 'internal' ? 'INTERNA' : 
+                          key === 'panoramic' ? 'PANORÁMICA' : 
+                          key === 'certified' ? 'CERTIFICADA (IA)' : 
+                          key === 'closeup' ? 'DE CERCA (IA)' : key.toUpperCase();
+          
+          const msgId = await sendTelegramNotification(`${baseMsg}\n\n📷 *Foto:* ${typeLabel}`, currentProject.telegramChatId, blob);
+          if (msgId) telegramMessageIds.push(msgId);
+        }
       }
 
-      setEquipmentReportFile(null);
+      const hasAI = !!(updatedPhotos.certified || updatedPhotos.closeup);
+
+      const recordToSave: EquipmentRecord = {
+        id: recordId,
+        projectId: currentProjectId,
+        contractorId: currentContractorId || '',
+        userId: user.uid,
+        imageUrl: '',
+        code: 'SIN_PROCESAR', 
+        type: itemType, 
+        coordinates,
+        timestamp: exifTimestamp,
+        power: 'PENDIENTE',
+        extractedAt: new Date().toISOString(),
+        isNew: true,
+        method: 'LOCAL',
+        linkedItemId: selectedInventoryItemId,
+        kmzItemId: selectedInventoryItemId,
+        photos: updatedPhotos,
+        telegramMessageIds,
+        updatedAt: new Date().toISOString(),
+        hasAI: hasAI,
+        notes: `[Reportado desde Inventario: ${item?.name || 'Desconocido'}] ${equipmentReportNotes}`
+      } as EquipmentRecord;
+
+      // Storage sync
+      if (storageMode === 'local') {
+        const currentRecords = await storage.loadRecords(currentProjectId);
+        const recordIndex = currentRecords.findIndex(r => r.id === recordId);
+        let updated;
+        if (recordIndex >= 0) {
+          updated = [...currentRecords];
+          updated[recordIndex] = recordToSave as any;
+        } else {
+          updated = [recordToSave as any, ...currentRecords];
+        }
+        await storage.saveRecords(currentProjectId, updated);
+        
+        // Update local project timestamp
+        const localProjects = await storage.getLocalProjects(currentContractorId || '');
+        const updatedProjects = localProjects.map(p => 
+          p.id === currentProjectId ? { ...p, lastRecordsUpdate: new Date().toISOString() } : p
+        );
+        await storage.saveLocalProjects(currentContractorId || '', updatedProjects);
+        setProjects(updatedProjects);
+        
+        setRecords(updated);
+      } else {
+        await setDoc(doc(db, 'records', recordId), recordToSave);
+        if (user && storageMode === 'cloud') {
+          await updateDoc(doc(db, 'projects', currentProjectId), { 
+            lastRecordsUpdate: new Date().toISOString() 
+          });
+        }
+        setRecords(prev => [recordToSave, ...prev]);
+      }
+
+      // 5. Trigger extraction ONLY IF the specific AI photo is new
+      if (mainBlob && (photoCertified || photoCloseup)) {
+        processFiles([recordToSave]);
+      }
+
+      // Update local KMZ project state to reflect installation
+      if (kmzProject && selectedInventoryItemId) {
+        const updatedItems = kmzProject.items.map(i => 
+          i.id === selectedInventoryItemId ? { ...i, status: 'INSTALLED' as const } : i
+        );
+        const updatedKmz = { ...kmzProject, items: updatedItems };
+        setKmzProject(updatedKmz);
+        
+        // Persist Kmz change
+        if (storageMode === 'local') {
+          await storage.saveKmzProject(currentProjectId, updatedKmz);
+        } else {
+          await updateDoc(doc(db, 'kmz_projects', currentProjectId), { items: updatedItems });
+        }
+      }
+
+      // Reset form
+      setPhotoInternal(null);
+      setPhotoPanoramic(null);
+      setPhotoCertified(null);
+      setPhotoCloseup(null);
       setSelectedInventoryItemId('');
       setEquipmentReportNotes('');
       setError(null);
-      // Removed alert for a smoother experience, maybe a toast could be added later
-      // But adding a small notification or just relying on the list update is better.
 
     } catch (err: any) {
       console.error(err);
@@ -1904,6 +2405,16 @@ export default function App() {
     .filter(record => {
       const matchesSearch = (record.code || '').toLowerCase().includes(searchQuery.toLowerCase());
       const matchesType = typeFilter === 'ALL' || record.type === typeFilter;
+      
+      // Filter out reports that don't have AI photos and aren't processed yet
+      const isReport = record.linkedItemId || record.kmzItemId;
+      const isUnprocessed = record.code === 'SIN_PROCESAR';
+      const hasAI = record.hasAI ?? (!!(record.photos?.certified || record.photos?.closeup));
+      
+      if (isReport && isUnprocessed && !hasAI) {
+        return false;
+      }
+
       return matchesSearch && matchesType;
     })
     .sort((a, b) => {
@@ -2411,7 +2922,7 @@ export default function App() {
             isNew: !existingRecord
           };
 
-          if (user) {
+          if (user && storageMode === 'cloud') {
             try {
               const batch = writeBatch(db);
               
@@ -2439,9 +2950,6 @@ export default function App() {
                   lastUpdated: new Date().toISOString(),
                   items: arrayUnion(summary)
                 }, { merge: true });
-              } else {
-                // If existing, we should ideally replace it in the index, but simpler to remove/add if needed
-                // For now, let's just make sure we update the project last update
               }
 
               batch.update(doc(db, 'projects', currentProjectId), {
@@ -2452,6 +2960,19 @@ export default function App() {
             } catch (error) {
               handleFirestoreError(error, OperationType.WRITE, `records_batch/${newRecord.id}`);
             }
+          } else if (storageMode === 'local') {
+            // Save locally
+            const currentRecords = await storage.loadRecords(currentProjectId);
+            const updated = [newRecord, ...currentRecords];
+            await storage.saveRecords(currentProjectId, updated);
+            
+            // Also update the local project timestamp in local projects list
+            const localProjects = await storage.getLocalProjects(currentContractorId || '');
+            const updatedProjects = localProjects.map(p => 
+              p.id === currentProjectId ? { ...p, lastRecordsUpdate: new Date().toISOString() } : p
+            );
+            await storage.saveLocalProjects(currentContractorId || '', updatedProjects);
+            setProjects(updatedProjects);
           }
           
           if (!existingRecord) {
@@ -2483,8 +3004,13 @@ export default function App() {
       const batchResults = await Promise.all(batchPromises);
       const validResults = batchResults.filter((r): r is EquipmentRecord => r !== null);
       
-      if (validResults.length > 0 && !user) {
-        setRecords(prev => [...validResults, ...prev]);
+      if (validResults.length > 0 && (storageMode === 'local' || !user)) {
+        setRecords(prev => {
+          // If we're updating existing records, replace them
+          const newIds = new Set(validResults.map(r => r.id));
+          const filteredPrev = prev.filter(r => !newIds.has(r.id));
+          return [...validResults, ...filteredPrev];
+        });
       }
 
       // Add a small delay between batches to stay under the 10 RPM limit (Free Tier)
@@ -2513,6 +3039,52 @@ export default function App() {
     setIsUploading(false);
     setIsResuming(false);
     if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const compressImage = (file: File): Promise<Blob> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = (event) => {
+        const img = new Image();
+        img.src = event.target?.result as string;
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          const MAX_WIDTH = 1200;
+          const MAX_HEIGHT = 1200;
+          let width = img.width;
+          let height = img.height;
+
+          if (width > height) {
+            if (width > MAX_WIDTH) {
+              height *= MAX_WIDTH / width;
+              width = MAX_WIDTH;
+            }
+          } else {
+            if (height > MAX_HEIGHT) {
+              width *= MAX_HEIGHT / height;
+              height = MAX_HEIGHT;
+            }
+          }
+
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          ctx?.drawImage(img, 0, 0, width, height);
+
+          canvas.toBlob(
+            (blob) => {
+              if (blob) resolve(blob);
+              else reject(new Error('Canvas toBlob failed'));
+            },
+            'image/jpeg',
+            0.7
+          );
+        };
+        img.onerror = () => reject(new Error("Error loading image for compression"));
+      };
+      reader.onerror = (error) => reject(error);
+    });
   };
 
   const resizeImage = (file: File): Promise<string> => {
@@ -2565,43 +3137,9 @@ export default function App() {
     });
   };
 
-  const deleteRecord = async (id: string) => {
-    if (user && currentProjectId && storageMode === 'cloud') {
-      try {
-        const batch = writeBatch(db);
-        const record = records.find(r => r.id === id);
-        
-        batch.delete(doc(db, 'records', id));
-        batch.delete(doc(db, 'record_images', id));
-        
-        if (record) {
-          const summary: EquipmentRecordSummary = {
-            id: record.id,
-            code: record.code,
-            type: record.type,
-            coordinates: record.coordinates,
-            power: record.power,
-            extractedAt: record.extractedAt
-          };
-          batch.update(doc(db, 'project_indexes', currentProjectId), {
-            items: arrayRemove(summary)
-          });
-          
-          batch.update(doc(db, 'projects', currentProjectId), {
-            lastRecordsUpdate: new Date().toISOString()
-          });
-        }
-        
-        await batch.commit();
-      } catch (error: any) {
-        console.error("Error deleting record:", error);
-        setError("Error al borrar registro: " + (error.message || "Permiso denegado"));
-      }
-    }
-    
-    // Always update local state for immediate feedback or if in local mode
-    setRecords(prev => prev.filter(r => r.id !== id));
-    setRecordToDelete(null);
+  const deleteRecordLegacyWrapper = async (id: string) => {
+    const record = records.find(r => r.id === id);
+    if (record) deleteRecord(record);
   };
 
   const deleteFilteredRecords = async () => {
@@ -3247,11 +3785,10 @@ export default function App() {
             { id: 'INVENTORY', icon: Map, label: 'Inventario' },
             { id: 'EXTRACTION', icon: ImageIcon, label: 'Extracción' },
             { id: 'TEAM', icon: UserIcon, label: 'Equipo', adminOnly: true },
-            { id: 'SYSTEM', icon: ShieldCheck, label: 'Sistema', superAdminOnly: true },
+            { id: 'SYSTEM', icon: ShieldCheck, label: 'Sistema' },
           ].filter(tab => {
             if (techSession) return tab.id === 'REPORTS';
             if (tab.adminOnly && !isAdmin && !isSuperAdmin) return false;
-            if (tab.superAdminOnly && !isSuperAdmin) return false;
             return true;
           }).map(tab => (
             <button 
@@ -3382,9 +3919,24 @@ export default function App() {
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between border-b border-[#141414] pb-2 gap-2 sm:gap-4">
             <h2 className="font-serif italic text-lg">Registros Extraídos</h2>
             <div className="flex flex-wrap items-center gap-2 sm:gap-4">
-              {records.some(r => r.code === 'SIN_PROCESAR') && isOnline && (
+              {records.some(r => {
+                if (r.code !== 'SIN_PROCESAR') return false;
+                const isReport = r.linkedItemId || r.kmzItemId;
+                const hasAI = r.hasAI ?? (!!(r.photos?.certified || r.photos?.closeup));
+                if (isReport && !hasAI) return false;
+                return true;
+              }) && isOnline && (
                 <button 
-                  onClick={() => processFiles(records.filter(r => r.code === 'SIN_PROCESAR'))}
+                  onClick={() => {
+                    const toProcess = records.filter(r => {
+                      if (r.code !== 'SIN_PROCESAR') return false;
+                      const isReport = r.linkedItemId || r.kmzItemId;
+                      const hasAI = r.hasAI ?? (!!(r.photos?.certified || r.photos?.closeup));
+                      if (isReport && !hasAI) return false;
+                      return true;
+                    });
+                    processFiles(toProcess);
+                  }}
                   className="bg-purple-600 text-white px-4 py-1.5 rounded text-[10px] font-bold uppercase tracking-widest transition-all shadow-sm active:scale-95 flex items-center gap-2 hover:bg-purple-700"
                 >
                   <Zap size={12} />
@@ -3404,6 +3956,20 @@ export default function App() {
               >
                 <Map size={14} />
                 KML
+              </button>
+
+              <button 
+                onClick={exportToZip}
+                disabled={records.length === 0 || isSaving}
+                className={`
+                  flex items-center gap-2 px-4 py-1.5 border border-blue-600 rounded text-[10px] font-bold uppercase tracking-widest transition-all shadow-sm active:scale-95
+                  ${records.length === 0 || isSaving
+                    ? 'opacity-30 cursor-not-allowed' 
+                    : 'hover:bg-blue-600 hover:text-white text-blue-600'}
+                `}
+              >
+                {isSaving ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+                ZIP FOTOS
               </button>
               
               {newlyAddedIds.size > 0 && (
@@ -3501,24 +4067,41 @@ export default function App() {
                           }`}
                         >
                         <td className="p-4">
-                          <div 
-                            className="w-12 h-12 bg-slate-200 rounded overflow-hidden cursor-pointer flex items-center justify-center relative group/img"
-                            onClick={() => record.imageUrl ? setSelectedImage(record.imageUrl) : fetchRecordImage(record.id)}
-                          >
-                            {record.imageUrl ? (
-                              <img 
-                                src={record.imageUrl} 
-                                alt="Equipment" 
-                                className="w-full h-full object-cover transition-transform group-hover/img:scale-110"
-                                referrerPolicy="no-referrer"
-                              />
-                            ) : (
-                              <div className="flex flex-col items-center justify-center w-full h-full bg-slate-100 text-slate-400 hover:text-blue-600 transition-colors">
-                                {loadingImages.has(record.id) ? (
-                                  <Loader2 size={16} className="animate-spin" />
-                                ) : (
-                                  <ImageIcon size={16} />
-                                )}
+                          <div className="flex flex-col items-center gap-1">
+                            <div 
+                              className="w-12 h-12 bg-slate-200 rounded overflow-hidden cursor-pointer flex items-center justify-center relative group/img"
+                              onClick={() => record.imageUrl ? setSelectedImage(record.imageUrl) : fetchRecordImage(record.id)}
+                            >
+                              {record.imageUrl ? (
+                                <img 
+                                  src={record.imageUrl} 
+                                  alt="Equipment" 
+                                  className="w-full h-full object-cover transition-transform group-hover/img:scale-110"
+                                  referrerPolicy="no-referrer"
+                                />
+                              ) : (
+                                <div className="flex flex-col items-center justify-center w-full h-full bg-slate-100 text-slate-400 hover:text-blue-600 transition-colors">
+                                  {loadingImages.has(record.id) ? (
+                                    <Loader2 size={16} className="animate-spin" />
+                                  ) : (
+                                    <ImageIcon size={16} />
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                            {record.photos && (
+                              <div className="flex gap-1">
+                                {record.photos.internal && <div className="w-1.5 h-1.5 rounded-full bg-blue-500" title="Interna" />}
+                                {record.photos.panoramic && <div className="w-1.5 h-1.5 rounded-full bg-green-500" title="Panorámica" />}
+                                {record.photos.certified && <div className="w-1.5 h-1.5 rounded-full bg-purple-500" title="Certificada" />}
+                                {record.photos.closeup && <div className="w-1.5 h-1.5 rounded-full bg-purple-500" title="De Cerca" />}
+                                {(() => {
+                                  const isReserva = record.type === 'RESERVA';
+                                  const isMissing = isReserva 
+                                    ? !(record.photos.closeup && record.photos.panoramic)
+                                    : !(record.photos.internal && record.photos.panoramic && record.photos.certified);
+                                  return isMissing ? <AlertTriangle size={8} className="text-orange-500 ml-1" /> : null;
+                                })()}
                               </div>
                             )}
                           </div>
@@ -3628,7 +4211,7 @@ export default function App() {
                               </button>
                             )}
                             <button 
-                              onClick={() => setRecordToDelete(record.id)}
+                              onClick={() => setRecordToDelete(record)}
                               className="p-2 hover:bg-red-500 hover:text-white rounded transition-colors text-red-600"
                               title="Eliminar"
                             >
@@ -3731,7 +4314,7 @@ export default function App() {
               </div>
 
               {/* Stats Grid */}
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div className="bg-white p-6 rounded-xl border border-[#141414]/5 shadow-sm flex flex-col justify-between">
                   <div>
                     <div className="text-[10px] uppercase tracking-widest font-bold opacity-40 mb-1">Proyecto KMZ Activo</div>
@@ -3759,35 +4342,108 @@ export default function App() {
                     </button>
                   </div>
                 </div>
-                
-                {['CTO', 'MUFA', 'RESERVA'].map(type => {
-                  const items = (kmzProject?.items || []).filter(i => i.type === type);
-                  const installed = items.filter(i => i.status === 'INSTALLED').length;
-                  const percent = items.length > 0 ? Math.round((installed / items.length) * 100) : 0;
+
+                {/* Combined Equipment & Reserves Box */}
+                <div className="bg-white p-6 rounded-xl border border-[#141414]/5 shadow-sm">
+                  <div className="flex justify-between items-start mb-4">
+                    <div className="text-[10px] uppercase tracking-widest font-bold opacity-40">Equipos y Reservas</div>
+                    {(() => {
+                      const allItems = kmzProject.items;
+                      const allInstalled = allItems.filter(i => i.status === 'INSTALLED').length;
+                      const allPercent = allItems.length > 0 ? Math.round((allInstalled / allItems.length) * 100) : 0;
+                      return (
+                        <div className={`text-[10px] font-bold px-2 py-0.5 rounded ${
+                          allPercent === 100 ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'
+                        }`}>
+                          {allPercent}%
+                        </div>
+                      );
+                    })()}
+                  </div>
                   
-                  return (
-                    <div key={type} className="bg-white p-6 rounded-xl border border-[#141414]/5 shadow-sm">
-                      <div className="flex justify-between items-start mb-4">
-                        <div className="text-[10px] uppercase tracking-widest font-bold opacity-40">{type}s</div>
+                  <div className="space-y-3">
+                    {['CTO', 'MUFA', 'RESERVA'].map(type => {
+                      const items = kmzProject.items.filter(i => i.type === type);
+                      const installed = items.filter(i => i.status === 'INSTALLED').length;
+                      const percent = items.length > 0 ? Math.round((installed / items.length) * 100) : 0;
+                      
+                      return (
+                        <div key={type} className="space-y-1">
+                          <div className="flex justify-between text-[9px] font-bold uppercase tracking-tighter">
+                            <span className="opacity-40">{type}s</span>
+                            <span>{installed} / {items.length}</span>
+                          </div>
+                          <div className="w-full h-1 bg-[#F8F9FA] rounded-full overflow-hidden">
+                            <motion.div 
+                              initial={{ width: 0 }}
+                              animate={{ width: `${percent}%` }}
+                              className={`h-full rounded-full ${percent === 100 ? 'bg-green-500' : 'bg-blue-600'}`}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Tendido Status Box */}
+                <div className="bg-white p-6 rounded-xl border border-[#141414]/5 shadow-sm">
+                  <div className="flex justify-between items-start mb-4">
+                    <div className="text-[10px] uppercase tracking-widest font-bold opacity-40">Estatus de Tendido</div>
+                    {(() => {
+                      const totalNeeded = kmzProject.tendidos.length;
+                      const completed = kmzProject.tendidos.filter(t => tendidoReports.some(r => r.tendidoId === t.id)).length;
+                      const percent = totalNeeded > 0 ? Math.round((completed / totalNeeded) * 100) : 0;
+                      return (
                         <div className={`text-[10px] font-bold px-2 py-0.5 rounded ${
                           percent === 100 ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'
                         }`}>
                           {percent}%
                         </div>
+                      );
+                    })()}
+                  </div>
+                  
+                  {(() => {
+                    const totalNeeded = kmzProject.tendidos.length;
+                    const completed = kmzProject.tendidos.filter(t => tendidoReports.some(r => r.tendidoId === t.id)).length;
+                    const totalDistance = kmzProject.tendidos.reduce((acc, t) => acc + t.totalDistance, 0);
+                    const realDistance = kmzProject.tendidos.reduce((acc, t) => {
+                      const reports = tendidoReports.filter(r => r.tendidoId === t.id);
+                      return acc + reports.reduce((rAcc, r) => rAcc + Math.abs(r.endMeter - r.startMeter), 0);
+                    }, 0);
+                    const distancePercent = totalDistance > 0 ? Math.min(100, Math.round((realDistance / totalDistance) * 100)) : 0;
+
+                    return (
+                      <div className="space-y-4">
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <div className="text-[18px] font-bold leading-none">{completed} <span className="text-[10px] opacity-30 font-normal">/ {totalNeeded}</span></div>
+                            <div className="text-[8px] uppercase tracking-widest font-bold opacity-40 mt-1">Tramos</div>
+                          </div>
+                          <div className="text-right">
+                            <div className="text-[18px] font-bold leading-none text-green-700">{Math.round(realDistance).toLocaleString()}m</div>
+                            <div className="text-[8px] uppercase tracking-widest font-bold opacity-40 mt-1">Instalado real</div>
+                          </div>
+                        </div>
+
+                        <div className="space-y-1">
+                          <div className="flex justify-between text-[9px] font-bold uppercase tracking-tighter">
+                            <span className="opacity-40">Avance Distancia</span>
+                            <span>{distancePercent}%</span>
+                          </div>
+                          <div className="w-full h-1.5 bg-[#F8F9FA] rounded-full overflow-hidden">
+                            <motion.div 
+                              initial={{ width: 0 }}
+                              animate={{ width: `${distancePercent}%` }}
+                              className="h-full bg-green-500 rounded-full"
+                            />
+                          </div>
+                        </div>
                       </div>
-                      <div className="text-2xl font-bold">{installed} <span className="text-sm opacity-30">/ {items.length}</span></div>
-                      <div className="w-full h-1.5 bg-[#F8F9FA] rounded-full mt-4 overflow-hidden">
-                        <motion.div 
-                          initial={{ width: 0 }}
-                          animate={{ width: `${percent}%` }}
-                          className={`h-full rounded-full ${
-                            percent === 100 ? 'bg-green-500' : 'bg-blue-600'
-                          }`}
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
+                    );
+                  })()}
+                </div>
               </div>
 
               {/* Inventory Table */}
@@ -4516,7 +5172,7 @@ export default function App() {
         </div>
       )}
 
-      {activeTab === 'SYSTEM' && isSuperAdmin && (
+      {activeTab === 'SYSTEM' && (
         <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-20">
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
             <div className="flex items-center gap-4">
@@ -4542,8 +5198,9 @@ export default function App() {
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
             <div className="md:col-span-2 space-y-4">
-              <div className="bg-white rounded-3xl border border-[#141414]/5 shadow-sm overflow-hidden border-b-2 border-b-[#141414]/10">
-                <table className="w-full border-collapse">
+              {(isAdmin || isSuperAdmin) ? (
+                <div className="bg-white rounded-3xl border border-[#141414]/5 shadow-sm overflow-hidden border-b-2 border-b-[#141414]/10">
+                  <table className="w-full border-collapse">
                   <thead>
                     <tr className="bg-[#F8F9FA] text-left border-b border-[#141414]/5">
                       <th className="p-6 font-serif italic text-[11px] uppercase tracking-[0.2em] opacity-50">Contratista</th>
@@ -4623,85 +5280,102 @@ export default function App() {
                   </tbody>
                 </table>
               </div>
+              ) : (
+                <div className="bg-white rounded-3xl p-8 border border-[#141414]/5 shadow-sm flex flex-col items-center justify-center text-center space-y-4 min-h-[300px]">
+                  <div className="w-16 h-16 bg-[#F8F9FA] rounded-full flex items-center justify-center text-[#141414]/20">
+                    <Building2 size={32} />
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-lg">Información del Sistema</h3>
+                    <p className="text-sm text-[#141414]/50 max-w-sm mx-auto">Esta sección permite gestionar la configuración técnica de tu sesión. Las opciones administrativas están restringidas.</p>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="space-y-6">
-              <div className="bg-[#141414] p-8 rounded-3xl text-[#E4E3E0] shadow-2xl space-y-4">
-                <Send size={32} className="text-blue-400" />
-                <div className="flex items-center justify-between">
-                  <h3 className="text-xl font-bold italic font-serif leading-tight">Bot de Telegram</h3>
-                  {telegramBotToken && (
-                    <div className="flex items-center gap-2 bg-green-500/10 border border-green-500/20 px-3 py-1 rounded-full">
-                      <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
-                      <span className="text-[9px] font-black uppercase text-green-500 tracking-widest">Bot Activo Global</span>
-                    </div>
-                  )}
-                </div>
-                <p className="text-[11px] opacity-60 leading-relaxed font-medium">
-                  Configura el token maestro del bot. Este bot será el encargado de enviar TODOS los reportes de TODAS las empresas y proyectos del sistema.
-                </p>
-                <div className="pt-4 border-t border-white/10 space-y-4">
-                  <div className="bg-blue-600/10 border border-blue-400/20 p-4 rounded-2xl space-y-2">
-                    <p className="text-[10px] font-black tracking-widest text-blue-400 uppercase">Guía Maestra</p>
-                    <ol className="text-[10px] space-y-1 list-decimal ml-3 opacity-80 leading-relaxed font-medium">
-                      <li>El bot configurado aquí es el único necesario para todo el sistema.</li>
-                      <li>Solo tú ({user?.email}) puedes modificar este token.</li>
-                      <li>Las empresas individuales solo configuran su respectivo "ID de Chat" para recibir sus reportes.</li>
-                    </ol>
+              {isSuperAdmin && (
+                <div className="bg-[#141414] p-8 rounded-3xl text-[#E4E3E0] shadow-2xl space-y-4">
+                  <Send size={32} className="text-blue-400" />
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xl font-bold italic font-serif leading-tight">Bot de Telegram</h3>
+                    {telegramBotToken && (
+                      <div className="flex items-center gap-2 bg-green-500/10 border border-green-500/20 px-3 py-1 rounded-full">
+                        <span className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+                        <span className="text-[9px] font-black uppercase text-green-500 tracking-widest">Bot Activo Global</span>
+                      </div>
+                    )}
                   </div>
-                  <div className="space-y-2">
-                    <div className="flex justify-between items-center">
-                      <label className="text-[10px] uppercase tracking-widest font-bold opacity-50">Token Global del Bot</label>
-                      {telegramBotToken && (
-                        <span className="text-[9px] opacity-40 font-mono">Token configurado • Secreto</span>
-                      )}
+                  <p className="text-[11px] opacity-60 leading-relaxed font-medium">
+                    Configura el token maestro del bot. Este bot será el encargado de enviar TODOS los reportes de TODAS las empresas y proyectos del sistema.
+                  </p>
+                  <div className="pt-4 border-t border-white/10 space-y-4">
+                    <div className="bg-blue-600/10 border border-blue-400/20 p-4 rounded-2xl space-y-2">
+                      <p className="text-[10px] font-black tracking-widest text-blue-400 uppercase">Guía Maestra</p>
+                      <ol className="text-[10px] space-y-1 list-decimal ml-3 opacity-80 leading-relaxed font-medium">
+                        <li>El bot configurado aquí es el único necesario para todo el sistema.</li>
+                        <li>Solo tú ({user?.email}) puedes modificar este token.</li>
+                        <li>Las empresas individuales solo configuran su respectivo "ID de Chat" para recibir sus reportes.</li>
+                      </ol>
                     </div>
-                    <div className="flex gap-2">
-                      <input 
-                        type="password"
-                        value={telegramBotToken}
-                        onChange={(e) => setTelegramBotToken(e.target.value)}
-                        placeholder="Configure el token solo una vez..."
-                        className="flex-1 bg-white/5 border border-white/10 rounded-xl p-3 text-xs outline-none focus:border-blue-400 font-mono"
-                      />
-                      <button 
-                        onClick={async () => {
-                          if (!telegramBotToken) return;
-                          setIsSavingBotToken(true);
-                          try {
-                            const resp = await fetch(`https://api.telegram.org/bot${telegramBotToken}/getMe`);
-                            const data = await resp.json();
-                            if (data.ok) {
-                              await saveTelegramBotToken(telegramBotToken);
-                              setError(null);
-                            } else {
-                              setError("Token de bot inválido. Verifique con BotFather.");
+                    <div className="space-y-2">
+                      <div className="flex justify-between items-center">
+                        <label className="text-[10px] uppercase tracking-widest font-bold opacity-50">Token Global del Bot</label>
+                        {telegramBotToken && (
+                          <span className="text-[9px] opacity-40 font-mono">Token configurado • Secreto</span>
+                        )}
+                      </div>
+                      <div className="flex gap-2">
+                        <input 
+                          type="password"
+                          value={telegramBotToken}
+                          onChange={(e) => setTelegramBotToken(e.target.value)}
+                          placeholder="Configure el token solo una vez..."
+                          className="flex-1 bg-white/5 border border-white/10 rounded-xl p-3 text-xs outline-none focus:border-blue-400 font-mono"
+                        />
+                        <button 
+                          onClick={async () => {
+                            if (!telegramBotToken) return;
+                            setIsSavingBotToken(true);
+                            try {
+                              const resp = await fetch(`https://api.telegram.org/bot${telegramBotToken}/getMe`);
+                              const data = await resp.json();
+                              if (data.ok) {
+                                await saveTelegramBotToken(telegramBotToken);
+                                setError(null);
+                              } else {
+                                setError("Token de bot inválido. Verifique con BotFather.");
+                              }
+                            } catch (err) {
+                              setError("Error al validar token. Verifique conexión.");
+                            } finally {
+                              setIsSavingBotToken(false);
                             }
-                          } catch (err) {
-                            setError("Error al validar token. Verifique conexión.");
-                          } finally {
-                            setIsSavingBotToken(false);
-                          }
-                        }}
-                        disabled={isSavingBotToken}
-                        className="bg-blue-600 px-4 py-3 rounded-xl hover:bg-blue-700 transition-all disabled:opacity-50 flex items-center gap-2 text-white shadow-lg shadow-blue-600/20"
-                      >
-                        {isSavingBotToken ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
-                        <span className="text-[10px] font-bold uppercase tracking-widest px-1">Guardar Global</span>
-                      </button>
+                          }}
+                          disabled={isSavingBotToken}
+                          className="bg-blue-600 px-4 py-3 rounded-xl hover:bg-blue-700 transition-all disabled:opacity-50 flex items-center gap-2 text-white shadow-lg shadow-blue-600/20"
+                        >
+                          {isSavingBotToken ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
+                          <span className="text-[10px] font-bold uppercase tracking-widest px-1">Guardar Global</span>
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </div>
-              </div>
+              )}
 
               <div className="bg-[#141414] p-8 rounded-3xl text-[#E4E3E0] shadow-2xl space-y-4">
                 <ShieldCheck size={32} className="text-blue-400" />
-                <h3 className="text-xl font-bold italic font-serif leading-tight">Control de Super-Admin</h3>
-                <p className="text-[11px] opacity-60 leading-relaxed font-medium">
-                  Este panel es exclusivo para <strong>{user?.email}</strong>. 
-                  Desde aquí creas los espacios aislados para cada cliente (Contratas).
-                  Cada empresa solo tendrá acceso a los proyectos que cree dentro de su ID asignado.
-                </p>
+                <h3 className="text-xl font-bold italic font-serif leading-tight">
+                  {isSuperAdmin ? 'Control de Super-Admin' : 'Preferencias del Sistema'}
+                </h3>
+                {isSuperAdmin && (
+                  <p className="text-[11px] opacity-60 leading-relaxed font-medium">
+                    Este panel es exclusivo para <strong>{user?.email}</strong>. 
+                    Desde aquí creas los espacios aislados para cada cliente (Contratas).
+                    Cada empresa solo tendrá acceso a los proyectos que cree dentro de su ID asignado.
+                  </p>
+                )}
                 <div className="pt-4 border-t border-white/10 space-y-4">
                   <div className="flex justify-between text-[10px] uppercase tracking-widest font-bold">
                     <span>Total Empresas</span>
@@ -5019,6 +5693,29 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Photos Section */}
+                  <div className="mt-8">
+                    <label className="text-[10px] uppercase tracking-widest font-bold opacity-50 mb-4 block">Evidencia Fotográfica (Abscisas)</label>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      <PhotoUploadSlot 
+                        id="photo-tendido-start"
+                        label="Punta Inicial (Abscisa)"
+                        file={photoTendidoStart}
+                        setFile={setPhotoTendidoStart}
+                        disabled={isSaving}
+                        isUploaded={!!(editingReportId && tendidoReports.find(r => r.id === editingReportId)?.photos?.startMeter)}
+                      />
+                      <PhotoUploadSlot 
+                        id="photo-tendido-end"
+                        label="Punta Final (Abscisa)"
+                        file={photoTendidoEnd}
+                        setFile={setPhotoTendidoEnd}
+                        disabled={isSaving}
+                        isUploaded={!!(editingReportId && tendidoReports.find(r => r.id === editingReportId)?.photos?.endMeter)}
+                      />
+                    </div>
+                  </div>
+
                   {/* Hardware Section */}
                   <div className="mt-8">
                     <label className="text-[10px] uppercase tracking-widest font-bold opacity-50 mb-4 block">Ferretería Utilizada</label>
@@ -5068,10 +5765,26 @@ export default function App() {
               ) : (
                 /* Equipment Report Form */
                 <div className="bg-blue-50/30 p-6 rounded-xl border border-blue-600/10">
-                   <h3 className="text-sm font-bold uppercase tracking-widest mb-6 flex items-center gap-2">
-                    <Box size={16} className="text-blue-600" />
-                    Reportar Foto de Equipo/Reserva
-                  </h3>
+                  <div className="flex items-center justify-between mb-6">
+                    <h3 className="text-sm font-bold uppercase tracking-widest flex items-center gap-2">
+                      <Box size={16} className="text-blue-600" />
+                      Reportar Foto de Equipo/Reserva
+                    </h3>
+                    
+                    <button 
+                      onClick={exportToZip}
+                      disabled={records.length === 0 || isSaving}
+                      className={`
+                        flex items-center gap-2 px-3 py-1 border border-blue-600 rounded text-[9px] font-bold uppercase tracking-widest transition-all shadow-sm active:scale-95
+                        ${records.length === 0 || isSaving
+                          ? 'opacity-30 cursor-not-allowed' 
+                          : 'hover:bg-blue-600 hover:text-white text-blue-600'}
+                      `}
+                    >
+                      {isSaving ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
+                      Extraer ZIP Fotos
+                    </button>
+                  </div>
 
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                     <div className="space-y-6">
@@ -5079,18 +5792,38 @@ export default function App() {
                         <label className="text-[10px] uppercase tracking-widest font-bold opacity-50">Seleccionar CTO/Mufa/Reserva</label>
                         <select 
                           value={selectedInventoryItemId}
-                          onChange={(e) => setSelectedInventoryItemId(e.target.value)}
+                          onChange={(e) => {
+                            setSelectedInventoryItemId(e.target.value);
+                            // Reset photo state when changing item to avoid confusion
+                            setPhotoInternal(null);
+                            setPhotoPanoramic(null);
+                            setPhotoCertified(null);
+                            setPhotoCloseup(null);
+                          }}
                           className="w-full bg-white border border-[#141414]/10 rounded-lg p-3 text-xs outline-none focus:border-blue-600"
                         >
                           <option value="">Seleccione elemento del inventario...</option>
                           {kmzProject.items
                             .filter(i => !isTechnician || i.assignedTo === techSession?.technicianId)
                             .map(item => {
+                              const existingRecord = records.find(r => r.linkedItemId === item.id || r.kmzItemId === item.id);
                               const isRegistered = item.status === 'INSTALLED' || item.manualStatus === 'INSTALLED';
+                              const photos = existingRecord?.photos || {};
+                              
+                              let isComplete = false;
+                              if (isRegistered && existingRecord) {
+                                if (item.type === 'RESERVA') {
+                                  isComplete = !!(photos.closeup && photos.panoramic);
+                                } else {
+                                  isComplete = !!(photos.internal && photos.panoramic && photos.certified);
+                                }
+                              }
+
                               return (
-                                <option key={item.id} value={item.id}>
-                                  {isRegistered ? '✅ ' : ''}
+                                <option key={item.id} value={item.id} className={!isComplete && isRegistered ? 'text-orange-600' : ''}>
+                                  {isComplete ? '✅ ' : (isRegistered ? '⚠️ ' : '')}
                                   {item.name} ({item.type} - {item.celda || 'Sin Celda'})
+                                  {!isComplete && isRegistered ? ' (FALTAN FOTOS)' : ''}
                                 </option>
                               );
                             })
@@ -5125,45 +5858,84 @@ export default function App() {
                     </div>
 
                     <div className="space-y-6">
-                      <div className="space-y-2">
-                        <label className="text-[10px] uppercase tracking-widest font-bold opacity-50">Subir Fotografía</label>
-                        <div className="relative">
-                          <input 
-                            type="file"
-                            accept="image/*"
-                            onChange={(e) => setEquipmentReportFile(e.target.files?.[0] || null)}
-                            className="hidden"
-                            id="equipment-report-file"
-                            disabled={isSubmittingEquipment}
-                          />
-                          <label 
-                            htmlFor="equipment-report-file"
-                            className={`flex flex-col items-center justify-center gap-3 p-8 border-2 border-dashed rounded-xl cursor-pointer transition-all ${
-                              equipmentReportFile ? 'bg-blue-50 border-blue-600/30' : 'bg-white border-[#141414]/10 hover:border-blue-600/30'
-                            }`}
-                          >
-                            {equipmentReportFile ? (
-                              <div className="text-center">
-                                <FileText className="mx-auto text-blue-600 mb-2" size={24} />
-                                <p className="text-[10px] font-bold text-blue-600 truncate max-w-[200px]">{equipmentReportFile.name}</p>
-                                <p className="text-[8px] opacity-40 uppercase tracking-tighter mt-1">Click para cambiar</p>
-                              </div>
-                            ) : (
-                              <>
-                                <UploadCloud size={32} className="text-[#141414]/20" />
-                                <div className="text-center">
-                                  <p className="text-[10px] font-bold uppercase tracking-widest">Seleccionar Imagen</p>
-                                  <p className="text-[8px] opacity-40 uppercase tracking-widest mt-1">Fotos de instalación con GPS preferiblemente</p>
-                                </div>
-                              </>
-                            )}
-                          </label>
-                        </div>
+                      <div className="space-y-4">
+                        <label className="text-[10px] uppercase tracking-widest font-bold opacity-50">Subir Fotografías</label>
+                        
+                        {selectedInventoryItemId ? (() => {
+                          const item = kmzProject?.items.find(i => i.id === selectedInventoryItemId);
+                          const isReserva = item?.type === 'RESERVA';
+                          const existingRecord = records.find(r => r.linkedItemId === selectedInventoryItemId || r.kmzItemId === selectedInventoryItemId);
+                          const existingPhotos = existingRecord?.photos || {};
+                          
+                          return (
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                              {!isReserva ? (
+                                <>
+                                  {/* CTO/MUFA Photos */}
+                                  <PhotoUploadSlot 
+                                    id="photo-internal"
+                                    label="Foto Interna"
+                                    file={photoInternal}
+                                    setFile={setPhotoInternal}
+                                    disabled={isSubmittingEquipment}
+                                    isUploaded={!!existingPhotos.internal}
+                                  />
+                                  <PhotoUploadSlot 
+                                    id="photo-panoramic"
+                                    label="Foto Panorámica"
+                                    file={photoPanoramic}
+                                    setFile={setPhotoPanoramic}
+                                    disabled={isSubmittingEquipment}
+                                    isUploaded={!!existingPhotos.panoramic}
+                                  />
+                                  <PhotoUploadSlot 
+                                    id="photo-certified"
+                                    label="Foto Certificada (IA)"
+                                    file={photoCertified}
+                                    setFile={setPhotoCertified}
+                                    disabled={isSubmittingEquipment}
+                                    isUploaded={!!existingPhotos.certified}
+                                    isIA
+                                  />
+                                </>
+                              ) : (
+                                <>
+                                  {/* Reserva Photos */}
+                                  <PhotoUploadSlot 
+                                    id="photo-closeup"
+                                    label="Foto de Cerca (IA)"
+                                    file={photoCloseup}
+                                    setFile={setPhotoCloseup}
+                                    disabled={isSubmittingEquipment}
+                                    isUploaded={!!existingPhotos.closeup}
+                                    isIA
+                                  />
+                                  <PhotoUploadSlot 
+                                    id="photo-panoramic"
+                                    label="Foto Panorámica"
+                                    file={photoPanoramic}
+                                    setFile={setPhotoPanoramic}
+                                    disabled={isSubmittingEquipment}
+                                    isUploaded={!!existingPhotos.panoramic}
+                                  />
+                                </>
+                              )}
+                            </div>
+                          );
+                        })() : (
+                          <div className="p-8 border-2 border-dashed rounded-xl bg-gray-50 border-gray-200 text-center">
+                            <p className="text-[10px] font-bold uppercase tracking-widest opacity-30">Selecciona un equipo para habilitar las fotos</p>
+                          </div>
+                        )}
                       </div>
 
                       <button 
                         onClick={submitEquipmentReport}
-                        disabled={!selectedInventoryItemId || !equipmentReportFile || isSubmittingEquipment}
+                        disabled={
+                          !selectedInventoryItemId || 
+                          isSubmittingEquipment || 
+                          !(photoInternal || photoPanoramic || photoCertified || photoCloseup)
+                        }
                         className="w-full bg-blue-600 text-white p-4 rounded-xl text-xs font-bold uppercase tracking-widest hover:bg-blue-700 transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-blue-600/20 flex items-center justify-center gap-2"
                       >
                         {isSubmittingEquipment ? (
@@ -5192,6 +5964,20 @@ export default function App() {
                   </div>
                   
                   <div className="flex items-center gap-3 bg-[#F8F9FA] p-2 rounded-xl border border-[#141414]/5">
+                    <button 
+                      onClick={exportToZip}
+                      disabled={records.length === 0 || isSaving}
+                      className={`
+                        flex items-center gap-2 px-3 py-1 border border-blue-600 rounded text-[9px] font-bold uppercase tracking-widest transition-all shadow-sm active:scale-95 mr-2
+                        ${records.length === 0 || isSaving
+                          ? 'opacity-30 cursor-not-allowed' 
+                          : 'hover:bg-blue-600 hover:text-white text-blue-600'}
+                      `}
+                    >
+                      {isSaving ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
+                      Extraer ZIP Fotos
+                    </button>
+                    <div className="w-px h-4 bg-[#141414]/10 mx-1" />
                     <Calendar size={14} className="text-blue-600 opacity-50" />
                     <input 
                       type="date"
@@ -5381,8 +6167,16 @@ export default function App() {
                                         <div className="col-span-1">
                                           <div className="flex items-center gap-2">
                                             <h4 className="font-bold text-sm italic">{tendido?.name || report.tendidoId || 'Diseño Anterior'}</h4>
-                                            {isOrphan && (
+                                            {isOrphan ? (
                                               <span className="text-[8px] bg-orange-200 text-orange-800 px-1.5 py-0.5 rounded font-bold uppercase">Huérfano</span>
+                                            ) : (
+                                              <span className={`text-[8px] px-1.5 py-0.5 rounded font-bold uppercase ${
+                                                report.startMeter > 0 && report.endMeter > 0 
+                                                  ? 'bg-green-100 text-green-700' 
+                                                  : 'bg-yellow-100 text-yellow-700'
+                                              }`}>
+                                                {report.startMeter > 0 && report.endMeter > 0 ? 'Completo' : 'Parcial'}
+                                              </span>
                                             )}
                                           </div>
                                           <p className="text-[9px] opacity-40 uppercase tracking-widest truncate">
@@ -5398,6 +6192,9 @@ export default function App() {
                                           <div className="flex items-center gap-1">
                                             <p className={`text-xs font-bold ${isWithinLimit || isOrphan ? 'text-green-600' : 'text-red-600'}`}>{Math.round(realDist)}m</p>
                                             {!isOrphan && <div className={`w-1.5 h-1.5 rounded-full ${isWithinLimit ? 'bg-green-500' : 'bg-red-500'}`} />}
+                                            {report.photos && (Object.values(report.photos).some(p => !!p)) && (
+                                              <Camera size={12} className="text-blue-500 ml-1" />
+                                            )}
                                           </div>
                                         </div>
                                         <div className="flex flex-col justify-center">
@@ -5415,6 +6212,13 @@ export default function App() {
                                         <Eye size={18} />
                                       </button>
                                       <button 
+                                        onClick={() => startEditingReport(report)}
+                                        className="p-2 hover:bg-green-50 rounded-lg text-gray-400 hover:text-green-600 transition-colors"
+                                        title="Editar reporte"
+                                      >
+                                        <Edit2 size={18} />
+                                      </button>
+                                      <button 
                                         onClick={() => deleteReport(report.id)}
                                         className="p-2 hover:bg-red-50 rounded-lg text-gray-400 hover:text-red-600 transition-colors"
                                         title="Eliminar reporte"
@@ -5430,14 +6234,14 @@ export default function App() {
                     )
                   ) : (
                     /* Equipment History mode */
-                    records.filter(r => (r as any).linkedItemId).length === 0 ? (
+                    records.filter(r => r.linkedItemId || r.kmzItemId).length === 0 ? (
                       <div className="py-12 text-center bg-[#F8F9FA] rounded-xl border border-dashed border-[#141414]/10">
                         <p className="text-sm opacity-40 italic">No hay reportes de equipos fotos-comprobantes para este proyecto.</p>
                       </div>
                     ) : (
                       records
                         .filter(r => {
-                          const isEquipmentReport = (r as any).linkedItemId;
+                          const isEquipmentReport = r.linkedItemId || r.kmzItemId;
                           const matchesUser = !isTechnician || r.userId === user?.uid;
                           if (!isEquipmentReport || !matchesUser) return false;
                           if (!reportDateFilter) return true;
@@ -5545,6 +6349,13 @@ export default function App() {
                                     >
                                       <RotateCcw size={10} />
                                       Ver Extracción
+                                    </button>
+                                    <button 
+                                      onClick={() => setRecordToDelete(record)}
+                                      className="text-[9px] font-bold uppercase text-red-600 hover:bg-red-50 p-2 rounded-lg transition-colors flex items-center gap-1"
+                                      title="Eliminar Reporte"
+                                    >
+                                      <Trash2 size={14} />
                                     </button>
                                   </div>
                                 </div>
@@ -6086,10 +6897,11 @@ export default function App() {
                   Cancelar
                 </button>
                 <button 
-                  onClick={() => deleteRecord(recordToDelete)}
-                  className="flex-1 bg-red-600 text-white py-3 text-xs uppercase tracking-widest hover:bg-red-700 transition-colors"
+                  onClick={() => recordToDelete && deleteRecord(recordToDelete)}
+                  disabled={isSaving}
+                  className="flex-1 bg-red-600 text-white py-3 text-xs uppercase tracking-widest hover:bg-red-700 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
                 >
-                  Confirmar
+                  {isSaving ? <Loader2 size={16} className="animate-spin" /> : 'Confirmar'}
                 </button>
               </div>
             </motion.div>
@@ -6417,7 +7229,16 @@ export default function App() {
                 <br />
                 <p><span className="font-bold">TECNICO:</span> {showReportSummary.technician}</p>
                 <br />
-                <p><span className="font-bold">TRAMO:</span> {kmzProject?.tendidos.find(t => t.id === showReportSummary.tendidoId)?.name}</p>
+                <div className="flex items-center gap-2 mb-1">
+                  <p><span className="font-bold">TRAMO:</span> {kmzProject?.tendidos.find(t => t.id === showReportSummary.tendidoId)?.name}</p>
+                  <span className={`text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider ${
+                    showReportSummary.startMeter > 0 && showReportSummary.endMeter > 0 
+                      ? 'bg-green-100 text-green-700' 
+                      : 'bg-yellow-100 text-yellow-700'
+                  }`}>
+                    {showReportSummary.startMeter > 0 && showReportSummary.endMeter > 0 ? 'Completo' : 'Parcial'}
+                  </span>
+                </div>
                 <br />
                 <p><span className="font-bold">Punta Inicial:</span> {showReportSummary.startMeter}m</p>
                 <p><span className="font-bold">Punta Final:</span> {showReportSummary.endMeter}m</p>
@@ -6450,9 +7271,29 @@ export default function App() {
                 {showReportSummary.notes && (
                   <>
                     <br />
-                    <p><span className="font-bold">OBSERVACIONES:</span></p>
-                    <p className="italic opacity-60">{showReportSummary.notes}</p>
+                    <p className="border-t border-[#141414]/5 pt-4 font-bold uppercase tracking-widest text-[10px] opacity-40 mb-2">Observaciones</p>
+                    <p className="italic opacity-60 leading-relaxed">{showReportSummary.notes}</p>
+                    <br />
                   </>
+                )}
+
+                {showReportSummary.photos && (Object.values(showReportSummary.photos).some(p => !!p)) && (
+                  <div className="pt-4 border-t border-[#141414]/5 space-y-4">
+                    <p className="font-bold uppercase tracking-widest text-[10px] opacity-40">Evidencia Fotográfica</p>
+                    <div className="grid grid-cols-2 gap-4">
+                      {['startMeter', 'endMeter'].map(key => {
+                        const storageId = (showReportSummary.photos as any)[key];
+                        if (!storageId) return null;
+                        const label = key === 'startMeter' ? 'Punta Inicial' : 'Punta Final';
+                        return (
+                          <div key={key} className="space-y-1">
+                            <p className="text-[8px] font-bold uppercase tracking-widest opacity-40">{label}</p>
+                            <PhotoPreview storageId={storageId} />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
                 )}
               </div>
 
@@ -6830,6 +7671,117 @@ export default function App() {
           </div>
         </div>
       </footer>
+    </div>
+  );
+}
+
+// Sub-componentes internos para modularizar vistas complejas
+function PhotoUploadSlot({ 
+  id, 
+  label, 
+  file, 
+  setFile, 
+  disabled, 
+  isIA = false,
+  isUploaded = false
+}: { 
+  id: string; 
+  label: string; 
+  file: File | null; 
+  setFile: (f: File | null) => void; 
+  disabled?: boolean;
+  isIA?: boolean;
+  isUploaded?: boolean;
+}) {
+  return (
+    <div className="space-y-1">
+      <label className="text-[8px] uppercase tracking-tighter font-bold opacity-40 ml-1 flex items-center justify-between">
+        <span>{label} {isIA && <span className="text-blue-600">(IA)</span>}</span>
+        {isUploaded && <span className="text-green-600 flex items-center gap-0.5"><CheckCircle size={8} /> Cargada</span>}
+      </label>
+      <div className="relative">
+        <input 
+          type="file"
+          accept="image/*"
+          onChange={(e) => setFile(e.target.files?.[0] || null)}
+          className="hidden"
+          id={id}
+          disabled={disabled}
+        />
+        <label 
+          htmlFor={id}
+          className={`flex flex-col items-center justify-center gap-2 p-4 border-2 border-dashed rounded-lg cursor-pointer transition-all ${
+            file ? 'bg-blue-50 border-blue-600/30' : (isUploaded ? 'bg-green-50 border-green-600/20' : 'bg-white border-[#141414]/10 hover:border-blue-600/30')
+          }`}
+        >
+          {file ? (
+            <div className="text-center w-full">
+              <ImageIcon className="mx-auto text-blue-600 mb-1" size={16} />
+              <p className="text-[9px] font-bold text-blue-600 truncate">{file.name}</p>
+            </div>
+          ) : isUploaded ? (
+            <div className="text-center w-full">
+              <CheckCircle className="mx-auto text-green-600 mb-1" size={16} />
+              <p className="text-[8px] font-bold uppercase tracking-widest text-green-600 opacity-60">Ya cargada</p>
+              <p className="text-[7px] text-green-600/40 uppercase">Click para reemplazar</p>
+            </div>
+          ) : (
+            <>
+              <UploadCloud size={20} className="text-[#141414]/20" />
+              <p className="text-[8px] font-bold uppercase tracking-widest opacity-40">Seleccionar</p>
+            </>
+          )}
+        </label>
+        {file && (
+          <button 
+            onClick={(e) => { e.preventDefault(); setFile(null); }}
+            className="absolute -top-3 -right-3 bg-red-500 text-white p-1 rounded-full shadow-lg z-10 hover:bg-red-600 transition-colors"
+            type="button"
+          >
+            <X size={12} />
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function PhotoPreview({ storageId }: { storageId: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  React.useEffect(() => {
+    let active = true;
+    let currentUrl: string | null = null;
+    const load = async () => {
+      try {
+        const blob = await storage.getBlob(storageId);
+        if (blob && active) {
+          currentUrl = URL.createObjectURL(blob);
+          setUrl(currentUrl);
+        }
+      } catch (e) {
+        console.error("Error loading photo preview:", e);
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+    load();
+    return () => { 
+      active = false;
+      if (currentUrl) URL.revokeObjectURL(currentUrl);
+    };
+  }, [storageId]);
+
+  if (loading) return <div className="aspect-video bg-gray-100 animate-pulse rounded-lg flex items-center justify-center text-[8px] uppercase tracking-widest opacity-20"><Loader2 size={12} className="animate-spin mr-1" /> Cargando...</div>;
+  if (!url) return <div className="aspect-video bg-gray-100/50 rounded-lg border border-dashed border-[#141414]/10 flex items-center justify-center text-[10px] opacity-30 italic">No disponible</div>;
+
+  return (
+    <div className="relative group cursor-pointer" onClick={() => window.open(url, '_blank')}>
+      <img src={url} alt="Preview" className="w-full aspect-video object-cover rounded-lg shadow-sm border border-[#141414]/5" />
+      <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center rounded-lg">
+        <ExternalLink size={16} className="text-white" />
+      </div>
     </div>
   );
 }

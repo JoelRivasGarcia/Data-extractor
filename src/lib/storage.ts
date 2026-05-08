@@ -8,6 +8,7 @@ const CONTRACTORS_KEY = 'local_contractors';
 const TECHNICIANS_KEY = 'local_technicians_';
 const PROJECTS_KEY = 'local_projects_';
 const REPORTS_KEY = 'local_reports_';
+const KMZ_PROJECT_PREFIX = 'kmz_project_';
 
 export interface PendingUpload {
   id: string;
@@ -40,6 +41,9 @@ export const storage = {
 
   async getBlob(id: string): Promise<Blob | null> {
     return await get<Blob>(`blob_${id}`) || null;
+  },
+  async deleteBlob(id: string): Promise<void> {
+    await del(`blob_${id}`);
   },
 
   async clearAll(): Promise<void> {
@@ -106,6 +110,14 @@ export const storage = {
 
   async getLocalReports(projectId: string): Promise<any[]> {
     return await get(`${REPORTS_KEY}${projectId}`) || [];
+  },
+
+  async saveKmzProject(projectId: string, data: any): Promise<void> {
+    await set(`${KMZ_PROJECT_PREFIX}${projectId}`, data);
+  },
+
+  async getKmzProject(projectId: string): Promise<any | null> {
+    return await get(`${KMZ_PROJECT_PREFIX}${projectId}`) || null;
   },
 
   async deleteLocalReports(projectId: string): Promise<void> {
